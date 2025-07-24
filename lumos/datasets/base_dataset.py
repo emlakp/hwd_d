@@ -12,12 +12,11 @@ from lumos.datasets.utils.episode_utils import (
 )
 import numpy as np
 from omegaconf import DictConfig
-import pyhash
+import mmh3
 import torch
 from torch.utils.data import Dataset
 import copy
 
-hasher = pyhash.fnv1_32()
 logger = logging.getLogger(__name__)
 
 
@@ -34,7 +33,9 @@ def get_validation_window_size(idx: int, min_window_size: int, max_window_size: 
         Window size computed with hash function.
     """
     window_range = max_window_size - min_window_size + 1
-    return min_window_size + hasher(str(idx)) % window_range
+
+    hash_val = mmh3.hash(str(idx)) & 0xFFFFFFFF  # ensure unsigned 32-bit
+    return min_window_size + (hash_val % window_range)
 
 
 class BaseDataset(Dataset):
