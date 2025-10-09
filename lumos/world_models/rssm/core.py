@@ -1,10 +1,11 @@
 from typing import Tuple
+
 import hydra
 from omegaconf import DictConfig
 import torch
+from torch import Tensor
 import torch.distributions as D
 import torch.nn as nn
-from torch import Tensor
 
 
 class RSSMCore(nn.Module):

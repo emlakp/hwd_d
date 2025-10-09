@@ -38,10 +38,16 @@ def train(cfg: DictConfig) -> None:
             from lumos.world_models.dreamer_v2 import DreamerV2
 
             model = DreamerV2.load_from_checkpoint(chk.as_posix())
+        elif cfg.world_model.name == "dreamer_v2_contextrssm":
+            from lumos.world_models.dreamer_v2_contextrssm import DreamerV2ContextRSSM
+
+            model = DreamerV2ContextRSSM.load_from_checkpoint(chk.as_posix())
         else:
             raise NotImplementedError(f"Unknown model: {cfg.world_model.name}")
     else:
         model = hydra.utils.instantiate(cfg.world_model)
+
+    print
 
     trainer_args = {**cfg.trainer, "logger": setup_logger(cfg), "callbacks": setup_callbacks(cfg.callbacks)}
     trainer = Trainer(**trainer_args)

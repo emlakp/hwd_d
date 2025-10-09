@@ -1,6 +1,13 @@
+import copy
 import logging
 from pathlib import Path
 from typing import Dict, Tuple, Union
+
+import mmh3
+import numpy as np
+from omegaconf import DictConfig
+import torch
+from torch.utils.data import Dataset
 
 from lumos.datasets.utils.episode_utils import (
     get_state_info_dict,
@@ -10,12 +17,6 @@ from lumos.datasets.utils.episode_utils import (
     process_rgb,
     process_state,
 )
-import numpy as np
-from omegaconf import DictConfig
-import mmh3
-import torch
-from torch.utils.data import Dataset
-import copy
 
 logger = logging.getLogger(__name__)
 
@@ -283,8 +284,12 @@ class BaseDataset(Dataset):
         Returns:
             Padded Tensor.
         """
-        last_repeated = torch.repeat_interleave(torch.unsqueeze(input_tensor[-1], dim=0), repeats=pad_size, dim=0)
-        padded = torch.vstack((input_tensor, last_repeated))
+        if pad_size == 0:
+            return input_tensor
+
+        last_frame = input_tensor[-1:]
+        last_repeated = last_frame.repeat_interleave(pad_size, dim=0)
+        padded = torch.cat((input_tensor, last_repeated), dim=0)
         return padded
 
     @staticmethod

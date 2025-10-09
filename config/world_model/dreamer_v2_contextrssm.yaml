@@ -1,0 +1,17 @@
+defaults:
+  - encoder: cnn_encoder
+  - decoder: cnn_decoder
+  - crssm: contextrssm
+  - amp: default
+  - optimizer: adamw
+  - loss: contextrssm
+
+_target_: lumos.world_models.dreamer_v2_contextrssm.DreamerV2ContextRSSM
+_recursive_: false
+
+name: dreamer_v2_contextrssm
+train_batch_size: 16
+val_batch_size: 16
+robot_dim: 15
+with_proprio: true
+use_gripper_camera: true

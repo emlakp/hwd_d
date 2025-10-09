@@ -1,0 +1,17 @@
+defaults:
+  - encoder: cnn_encoder
+  - decoder: cnn_decoder
+  - rssm: default
+  - amp: default
+  - optimizer: adamw
+  - loss: default_debug
+
+_target_: lumos.world_models.dreamer_v2.DreamerV2
+_recursive_: false
+
+name: dreamer_v2_debug
+train_batch_size: 64
+val_batch_size: 64
+with_proprio: true
+use_gripper_camera: true
+robot_dim: ${datamodule.proprioception_dims.n_state_obs}

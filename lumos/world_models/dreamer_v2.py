@@ -1,14 +1,15 @@
 import logging
+from typing import Any, Dict, Optional, Tuple, Union
+
 import hydra
 from omegaconf import DictConfig
-from typing import Dict, Union, Any, Tuple
+from pytorch_lightning.utilities import rank_zero_only
 import torch
 from torch import Tensor
-from pytorch_lightning.utilities import rank_zero_only
+import torch.distributions as D
+
 from lumos.utils.nn_utils import init_weights
 from lumos.world_models.world_model import WorldModel
-import torch.distributions as D
-from lumos.utils.gripper_control import world_to_tcp_frame
 
 logger = logging.getLogger(__name__)
 
@@ -32,26 +33,30 @@ class DreamerV2(WorldModel):
         amp: DictConfig,
         optimizer: DictConfig,
         loss: DictConfig,
-        batch_size: int,
+        train_batch_size: int,
+        val_batch_size: int,
         with_proprio: bool,
-        gripper_control: bool,
+        use_gripper_camera: bool,
+        robot_dim: int,
         name: str,
     ):
         super(DreamerV2, self).__init__(name=name)
+        self.use_gripper_camera = use_gripper_camera
 
         self.encoder = hydra.utils.instantiate(encoder)
         decoder.in_dim = rssm.cell.deter_dim + rssm.cell.stoch_dim * rssm.cell.stoch_rank
+        decoder.use_gripper_camera = self.use_gripper_camera
         self.decoder = hydra.utils.instantiate(decoder)
-        rssm.cell.embed_dim = encoder.cnn_depth * 32  # * 2
+        rssm.cell.embed_dim = encoder.cnn_depth * (2 ** (len(encoder.kernels) + 1))
         self.with_proprio = with_proprio
         if self.with_proprio:
-            rssm.cell.embed_dim += 15
+            rssm.cell.embed_dim += robot_dim
         self.rssm_core = hydra.utils.instantiate(rssm)
         self.autocast = hydra.utils.instantiate(amp.autocast)
         self.scaler = hydra.utils.instantiate(amp.scaler)
         self.optimizer = optimizer
-        self.batch_size = batch_size
-        self.gripper_control = gripper_control
+        self.train_batch_size = train_batch_size
+        self.val_batch_size = val_batch_size
 
         self.kl_balance = loss.kl_balance
         self.kl_weight = loss.kl_weight
@@ -72,7 +77,7 @@ class DreamerV2(WorldModel):
 
         for m in self.modules():
             init_weights(m)
-
+        self.num_val_batches = 0
         self.save_hyperparameters()
 
     def configure_optimizers(self):
@@ -82,23 +87,15 @@ class DreamerV2(WorldModel):
     def forward(
         self,
         rgb_s: Tensor,
-        rgb_g: Tensor,
         proprio: Tensor,
         act: Tensor,
-        robot_obs: Tensor,
         reset: Tensor,
         in_state: Tensor,
-        local_act: Tensor = None,
+        rgb_g: Tensor = None,
     ) -> Dict[str, Tensor]:
-
         embed = self.encoder(rgb_s, rgb_g)
         if self.with_proprio:
             embed = torch.cat((embed, proprio), -1)
-
-        if local_act is not None:
-            act = local_act
-        elif self.gripper_control:
-            act = world_to_tcp_frame(act, robot_obs)
 
         prior, post, features, out_states = self.rssm_core.forward(embed, act, reset, in_state)
 
@@ -119,27 +116,31 @@ class DreamerV2(WorldModel):
     def infer_features(
         self,
         rgb_s: Tensor,
-        rgb_g: Tensor,
         proprio: Tensor,
         actions: Tensor,
-        robot_obs: Tensor,
         reset: Tensor,
         in_state: Tensor,
-        local_act: Tensor = None,
+        rgb_g: Tensor = None,
     ) -> Tuple[Tensor, Tensor]:
         self.eval()
         with self.autocast:
+            # Prepare arguments for self(), ensuring device placement
+            rgb_s_dev = rgb_s.to(self.device)
+            rgb_g_dev = rgb_g.to(self.device) if rgb_g is not None else None
+            proprio_dev = proprio.to(self.device)
+            actions_dev = actions.to(self.device)
+            reset_dev = reset.to(self.device)
+
             outs = self(
-                rgb_s.to(self.device),
-                rgb_g.to(self.device),
-                proprio.to(self.device),
-                actions.to(self.device),
-                robot_obs.to(self.device),
-                reset.to(self.device),
+                rgb_s_dev,
+                proprio_dev,
+                actions_dev,
+                reset_dev,
                 in_state,
-                local_act=local_act,
+                rgb_g=rgb_g_dev,
             )
 
+        # features = torch.cat((outs["features"], outs["prior"]), -1)
         return outs["features"], outs["out_states"]
 
     def dream(self, act: Tensor, in_state: Tensor, temperature: float = 1.0) -> Tuple[Tensor, Tensor]:
@@ -147,7 +148,7 @@ class DreamerV2(WorldModel):
             pp, (h, z) = self.rssm_core.cell.forward(act, in_state, temperature=temperature)
         return pp, (h, z)
 
-    def pred_img(self, prior: Tensor, features: Tensor) -> Tensor:
+    def pred_img(self, prior: Tensor, features: Tensor) -> Tuple[Tensor, Optional[Tensor]]:
         with torch.no_grad():
             prior_samples = self.rssm_core.zdistr(prior).sample()
             prior_samples = prior_samples.reshape(prior_samples.shape[0], prior_samples.shape[1], -1)
@@ -157,22 +158,22 @@ class DreamerV2(WorldModel):
 
     def on_train_epoch_start(self) -> None:
         super(DreamerV2, self).on_train_epoch_start()
-        self.in_state = self.rssm_core.init_state(self.batch_size)
+        self.in_state = self.rssm_core.init_state(self.train_batch_size)
 
     def training_step(self, batch: Dict[str, Tensor], batch_idx: int) -> Dict[str, Union[Tensor, Any]]:
-
         opt = self.optimizers()
         opt.zero_grad()
+        batch = batch["vis"]
 
         with self.autocast:
+            rgb_g_input = batch["rgb_obs"].get("rgb_gripper")
             outs = self(
-                batch["vis"]["rgb_obs"]["rgb_static"],
-                batch["vis"]["rgb_obs"]["rgb_gripper"],
-                batch["vis"]["robot_obs"],
-                batch["vis"]["actions"]["pre_actions"],
-                batch["vis"]["state_info"]["pre_robot_obs"],
-                batch["vis"]["reset"],
+                batch["rgb_obs"]["rgb_static"],
+                batch["robot_obs"],
+                batch["actions"]["pre_actions"],
+                batch["reset"],
                 self.in_state,
+                rgb_g=rgb_g_input,
             )
             losses = self.loss(batch, outs)
             samples = (outs["prior"], outs["features"])
@@ -182,14 +183,21 @@ class DreamerV2(WorldModel):
         self.log_metrics(losses, mode="train")
         if self.global_step % self.trainer.log_every_n_steps == 0:
             pred_img_s, pred_img_g = self.pred_img(*samples)
+
+            gt_img_g_val, dcd_img_g_val, pred_img_g_val = None, None, None
+            if self.use_gripper_camera:
+                gt_img_g_val = batch["rgb_obs"].get("rgb_gripper")[-1, 0]
+                dcd_img_g_val = outs.get("dcd_img_g")[-1, 0]
+                pred_img_g_val = pred_img_g[-1, 0]
+
             self.log_images(
-                batch["vis"]["rgb_obs"]["rgb_static"][-1, 0],
-                batch["vis"]["rgb_obs"]["rgb_gripper"][-1, 0],
-                outs["dcd_img_s"][-1, 0],
-                outs["dcd_img_g"][-1, 0],
-                pred_img_s[-1, 0],
-                pred_img_g[-1, 0],
+                gt_img_s=batch["rgb_obs"]["rgb_static"][-1, 0],
+                dcd_img_s=outs["dcd_img_s"][-1, 0],
+                pred_img_s=pred_img_s[-1, 0],
                 mode="train",
+                gt_img_g=gt_img_g_val,
+                dcd_img_g=dcd_img_g_val,
+                pred_img_g=pred_img_g_val,
             )
 
         self.scaler.scale(losses["loss_total"]).backward()
@@ -201,19 +209,20 @@ class DreamerV2(WorldModel):
 
     def on_validation_epoch_start(self) -> None:
         super(DreamerV2, self).on_validation_epoch_start()
-        self.in_state = self.rssm_core.init_state(self.batch_size)
+        self.in_state = self.rssm_core.init_state(self.val_batch_size)
         self.running_metrics = {metric_name: 0 for metric_name in self.batch_metrics}
+        self.num_val_batches = 0
 
     def validation_step(self, batch: Dict[str, Tensor], batch_idx: int) -> Dict[str, Union[Tensor, Any]]:
         with self.autocast:
+            rgb_g_input = batch["rgb_obs"].get("rgb_gripper")
             outs = self(
-                batch["vis"]["rgb_obs"]["rgb_static"],
-                batch["vis"]["rgb_obs"]["rgb_gripper"],
-                batch["vis"]["robot_obs"],
-                batch["vis"]["actions"]["pre_actions"],
-                batch["vis"]["state_info"]["pre_robot_obs"],
-                batch["vis"]["reset"],
+                batch["rgb_obs"]["rgb_static"],
+                batch["robot_obs"],
+                batch["actions"]["pre_actions"],
+                batch["reset"],
                 self.in_state,
+                rgb_g=rgb_g_input,
             )
             losses = self.loss(batch, outs)
             samples = (outs["prior"], outs["features"])
@@ -222,32 +231,38 @@ class DreamerV2(WorldModel):
 
         for key in losses.keys():
             self.running_metrics[key] += losses[key]
+        self.num_val_batches += 1
 
         # keep track of last batch for logging
-        self.val_gt_img_s = batch["vis"]["rgb_obs"]["rgb_static"][-1, 0]
-        self.val_gt_img_g = batch["vis"]["rgb_obs"]["rgb_gripper"][-1, 0]
+        self.val_gt_img_s = batch["rgb_obs"]["rgb_static"][-1, 0]
         self.val_dcd_img_s = outs["dcd_img_s"][-1, 0]
-        self.val_dcd_img_g = outs["dcd_img_g"][-1, 0]
+
+        self.val_gt_img_g, self.val_dcd_img_g = None, None
+        if self.use_gripper_camera:
+            self.val_gt_img_g = rgb_g_input[-1, 0]
+            self.val_dcd_img_g = outs.get("dcd_img_g")[-1, 0]
+
         self.val_samples = samples
         return losses["loss_total"]
 
     def on_validation_epoch_end(self) -> None:
-        if self.trainer.sanity_checking:
-            num_val_batches = 2
-        else:
-            num_val_batches = len(self.trainer.datamodule.val_dataloader())
         for key in self.running_metrics.keys():
-            self.running_metrics[key] /= num_val_batches
-        self.log_metrics(self.running_metrics, mode="val")
+            self.running_metrics[key] /= self.num_val_batches
+        self.log_metrics(self.running_metrics, mode="val", sync_dist=True)
         pred_img_s, pred_img_g = self.pred_img(*self.val_samples)
+
+        pred_img_g_val = None
+        if self.use_gripper_camera:
+            pred_img_g_val = pred_img_g[-1, 0]
+
         self.log_images(
-            self.val_gt_img_s,
-            self.val_gt_img_g,
-            self.val_dcd_img_s,
-            self.val_dcd_img_g,
-            pred_img_s[-1, 0],
-            pred_img_g[-1, 0],
+            gt_img_s=self.val_gt_img_s,
+            dcd_img_s=self.val_dcd_img_s,
+            pred_img_s=pred_img_s[-1, 0],
             mode="val",
+            gt_img_g=self.val_gt_img_g,
+            dcd_img_g=self.val_dcd_img_g,
+            pred_img_g=pred_img_g_val,
         )
 
     def loss(self, batch: Dict[str, Tensor], outs: Dict[str, Tensor]) -> Dict[str, Tensor]:
@@ -257,8 +272,15 @@ class DreamerV2(WorldModel):
         loss_kl_prior = D.kl.kl_divergence(self.rssm_core.zdistr(outs["post"].detach()), dprior)
         loss_kl = (1 - self.kl_balance) * loss_kl_post + self.kl_balance * loss_kl_prior
 
-        obs = torch.cat([batch["vis"]["rgb_obs"]["rgb_static"], batch["vis"]["rgb_obs"]["rgb_gripper"]], dim=2)
-        dcd_img = torch.cat([outs["dcd_img_s"], outs["dcd_img_g"]], dim=2)
+        obs_list = [batch["rgb_obs"]["rgb_static"]]
+        dcd_img_list = [outs["dcd_img_s"]]
+
+        if self.use_gripper_camera:
+            obs_list.append(batch["rgb_obs"].get("rgb_gripper"))
+            dcd_img_list.append(outs.get("dcd_img_g"))
+
+        obs = torch.cat(obs_list, dim=2)
+        dcd_img = torch.cat(dcd_img_list, dim=2)
         loss_reconstr = 0.5 * torch.square(dcd_img - obs).sum(dim=[-1, -2, -3])  # MSE
 
         loss = self.kl_weight * loss_kl + self.image_weight * loss_reconstr

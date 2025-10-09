@@ -1,0 +1,7 @@
+_target_: pytorch_lightning.callbacks.ModelCheckpoint
+save_top_k: -1
+dirpath: ???
+filename: "{epoch}"
+every_n_epochs: 3
+save_last: true
+verbose: true

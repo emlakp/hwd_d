@@ -1,14 +1,15 @@
 import logging
 
 import numpy as np
+import torch
+from torch.cuda.amp import autocast
+
 from lumos.utils.pytorch3d_transforms import (
     euler_angles_to_matrix,
     matrix_to_euler_angles,
     matrix_to_quaternion,
     quaternion_to_matrix,
 )
-import torch
-from torch.cuda.amp import autocast
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +40,6 @@ def world_to_tcp_frame(action, robot_obs):
 
 def tcp_to_world_frame(action, robot_obs):
     with autocast(dtype=torch.float32):
-
         s, b, _ = action.shape
         # b, _ = action.shape
         world_T_tcp = euler_angles_to_matrix(robot_obs[..., 3:6], convention="XYZ").float().view(-1, 3, 3)

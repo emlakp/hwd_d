@@ -1,7 +1,7 @@
 from typing import Dict, List
 
+from lightning.pytorch.utilities.combined_loader import CombinedLoader
 import pytorch_lightning as pl
-from pytorch_lightning.trainer.supporters import CombinedLoader
 import torch
 from torch.utils.data import DataLoader
 import torchvision

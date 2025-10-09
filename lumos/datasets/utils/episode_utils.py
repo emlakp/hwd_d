@@ -2,7 +2,8 @@ import logging
 import os
 from pathlib import Path
 import re
-from typing import Dict, Tuple, List
+from typing import Dict, List, Tuple
+
 import numpy as np
 from omegaconf import DictConfig, ListConfig, OmegaConf
 import torch
@@ -55,7 +56,11 @@ def process_state(
         state_obs_sliced.append(seq_state_obs_)
     seq_state_obs = torch.cat(state_obs_sliced, dim=1)
 
-    return {"robot_obs": seq_state_obs}
+    if "robot_obs" in state_obs_keys:
+        if "scene_obs" in state_obs_keys:
+            return {"state_obs": seq_state_obs}
+        else:
+            return {"robot_obs": seq_state_obs}
 
 
 def process_rgb(
@@ -184,9 +189,13 @@ def load_dataset_statistics(train_dataset_dir, val_dataset_dir, transforms):
         transforms: potentially updated transforms
     """
     paths = {"train": train_dataset_dir, "val": val_dataset_dir}
+    if "minmax" in str.lower(transforms["train"]["robot_obs"][0]["_target_"]):
+        stats_file = "statistics_minmax.yaml"
+    else:
+        stats_file = "statistics.yaml"
     for dataset_type in ["train", "val"]:
         try:
-            statistics = OmegaConf.load(Path(paths[dataset_type]) / "statistics.yaml")
+            statistics = OmegaConf.load(Path(paths[dataset_type]) / stats_file)
             # Hack for maintaining two repositories with transforms
             statistics = OmegaConf.create(OmegaConf.to_yaml(statistics).replace("calvin_agent.", "lumos."))
             # this ugly piece of code only exists because OmegaConf actually can't merge ListConfigs.
@@ -206,7 +215,7 @@ def load_dataset_statistics(train_dataset_dir, val_dataset_dir, transforms):
                         if not exists:
                             transforms[dataset_type][modality] = ListConfig([*conf_transforms, dataset_trans])
         except FileNotFoundError:
-            logger.warning("Could not load statistics.yaml")
+            logger.warning(f"Could not load {stats_file}")
     return transforms
 
 

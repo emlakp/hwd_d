@@ -1,0 +1,686 @@
+import logging
+from copy import deepcopy
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
+import hydra
+from omegaconf import DictConfig, OmegaConf
+from omegaconf.errors import MissingMandatoryValue
+from pytorch_lightning.utilities import rank_zero_only
+import torch
+from torch import Tensor
+import torch.distributions as D
+from torch.optim import Adam
+import numpy as np
+from PIL import Image
+import wandb
+
+from lumos.utils.nn_utils import init_weights, st_clamp
+from lumos.world_models.world_model import WorldModel
+from lumos.world_models.contextrssm.core import ContextRSSMCore
+
+logger = logging.getLogger(__name__)
+
+
+@rank_zero_only
+def log_rank_0(*args, **kwargs):
+    logger.info(*args, **kwargs)
+
+
+class DreamerV2ContextRSSM(WorldModel):
+    """
+    The lightning module used for training DreamerV2 with Context RSSM.
+    """
+
+    def __init__(
+        self,
+        encoder: DictConfig,
+        decoder: DictConfig,
+        crssm: DictConfig,
+        amp: DictConfig,
+        optimizer: DictConfig,
+        loss: DictConfig,
+        train_batch_size: int,
+        val_batch_size: int,
+        with_proprio: bool,
+        use_gripper_camera: bool,
+        robot_dim: int,
+        name: str,
+    ):
+        super(DreamerV2ContextRSSM, self).__init__(name=name)
+        self.use_gripper_camera = use_gripper_camera
+
+        self.encoder = hydra.utils.instantiate(encoder)
+
+        self.deter_dim = crssm.cell.deter_dim
+        self.stoch_dim_total = crssm.cell.stoch_dim * (crssm.cell.stoch_rank or 1)
+        self.context_dim = crssm.cell.context_dim
+        precise_in_dim = self.deter_dim + self.stoch_dim_total + self.context_dim
+        coarse_in_dim = self.stoch_dim_total + self.context_dim
+
+        self.with_proprio = with_proprio
+        try:
+            current_embed_dim = crssm.cell.embed_dim
+        except MissingMandatoryValue:
+            current_embed_dim = None
+        crssm.cell.embed_dim = self._infer_embed_dim(current_embed_dim, robot_dim)
+        self.crssm_core = hydra.utils.instantiate(crssm)
+        if not isinstance(self.crssm_core, ContextRSSMCore):
+            raise TypeError(
+                "DreamerV2ContextRSSM expects crssm to instantiate ContextRSSMCore, "
+                f"got {type(self.crssm_core)}"
+            )
+
+        precise_cfg, coarse_cfg = self._prepare_decoder_cfgs(decoder, precise_in_dim, coarse_in_dim)
+        self.precise_decoder = hydra.utils.instantiate(precise_cfg)
+        self.coarse_decoder = hydra.utils.instantiate(coarse_cfg)
+        self.autocast = hydra.utils.instantiate(amp.autocast)
+        self.scaler = hydra.utils.instantiate(amp.scaler)
+        self.optimizer = optimizer
+        self.train_batch_size = train_batch_size
+        self.val_batch_size = val_batch_size
+
+        self.kl_balance = loss.kl_balance
+        self.kl_weight = loss.kl_weight
+        self.context_kl_weight = getattr(loss, "context_kl_weight", 1.0)
+        self.image_weight = loss.image_weight
+        self.grad_clip = loss.grad_clip
+        self.gate_activity_weight = getattr(loss, "gate_activity_weight", 0.0)
+        self.ctxt_sparsity_weight = getattr(loss, "ctxt_sparsity_weight", 0.0)
+
+        self.image_log_interval = getattr(loss, "image_log_interval", 1000)
+        self.grad_log_interval = getattr(loss, "grad_log_interval", 200)
+        self.metric_log_interval = getattr(loss, "metric_log_interval", None)
+        self.metric_flush_size = getattr(loss, "metric_flush_size", 500)
+
+        self.automatic_optimization = False
+
+        self.batch_metrics = [
+            "loss_total",
+            "loss_reconstr",
+            "loss_precise",
+            "loss_precise-static",
+            "loss_precise-gripper",
+            "loss_coarse",
+            "loss_coarse-static",
+            "loss_coarse-gripper",
+            "loss_kl-c",
+            "loss_kl-c-post",
+            "loss_kl-c-prior",
+            "loss_kl-p",
+            "loss_kl-p-post",
+            "loss_kl-p-prior",
+            "loss_gate-activity",
+            "loss_ctxt-sparsity",
+            "gate_activity",
+            "gate_sparsity",
+            "gate_time-steps",
+        ]
+
+        for m in self.modules():
+            init_weights(m)
+        self.num_val_batches = 0
+        self.train_step_history: List[Dict[str, float]] = []
+        self.save_hyperparameters()
+
+    def _prepare_decoder_cfgs(
+        self,
+        decoder_cfg: DictConfig,
+        precise_in_dim: int,
+        coarse_in_dim: int,
+    ) -> Tuple[DictConfig, DictConfig]:
+        """Create separate decoder configs for precise and coarse heads."""
+        decoder_dict = OmegaConf.to_container(decoder_cfg, resolve=False)
+        if not isinstance(decoder_dict, dict):
+            raise TypeError("decoder config must be a mapping")
+
+        if "precise" in decoder_dict or "coarse" in decoder_dict:
+            if "precise" not in decoder_dict or "coarse" not in decoder_dict:
+                raise ValueError("decoder config must define both 'precise' and 'coarse' sections")
+            precise_dict = deepcopy(decoder_dict["precise"])
+            coarse_dict = deepcopy(decoder_dict["coarse"])
+        else:
+            precise_dict = deepcopy(decoder_dict)
+            coarse_dict = deepcopy(decoder_dict)
+
+        precise_dict["in_dim"] = precise_in_dim
+        coarse_dict["in_dim"] = coarse_in_dim
+        precise_dict["use_gripper_camera"] = self.use_gripper_camera
+        coarse_dict["use_gripper_camera"] = self.use_gripper_camera
+
+        precise_cfg = OmegaConf.create(precise_dict)
+        coarse_cfg = OmegaConf.create(coarse_dict)
+        return precise_cfg, coarse_cfg
+
+    def configure_optimizers(self):
+        optimizer = Adam(self.parameters(), lr=3e-5)
+        return {"optimizer": optimizer}
+
+
+    def forward(
+        self,
+        rgb_s: Tensor,
+        s_obs: Tensor,
+        act: Tensor,
+        reset: Tensor,
+        in_state: Tensor,
+        rgb_g: Tensor = None,
+    ) -> Dict[str, Tensor]:
+        embed = self._encode_observations(rgb_s, rgb_g, s_obs)
+
+        outputs, out_states = self.crssm_core.forward(embed, act, reset, in_state)
+
+        precise_out = self.precise_decoder(outputs["features"])
+        dcd_img_s, dcd_img_g, dcd_s_obs = self._unpack_precise_decoder(precise_out)
+
+        coarse_input = torch.cat((outputs["stoch"], outputs["context"]), dim=-1)
+        coarse_out = self.coarse_decoder(coarse_input)
+        coarse_rgb, coarse_rgb_g = self._unpack_coarse_decoder(coarse_out)
+
+        outputs["dcd_img_s"] = dcd_img_s
+        if dcd_img_g is not None:
+            outputs["dcd_img_g"] = dcd_img_g
+        if dcd_s_obs is not None:
+            outputs["dcd_s_obs"] = dcd_s_obs
+        outputs["coarse_rgb"] = coarse_rgb
+        if coarse_rgb_g is not None:
+            outputs["coarse_rgb_gripper"] = coarse_rgb_g
+        outputs["out_states"] = out_states
+
+        return outputs
+
+    @staticmethod
+    def _unpack_precise_decoder(decoded: Any) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
+        if isinstance(decoded, (tuple, list)):
+            if len(decoded) == 3:
+                return decoded[0], decoded[1], decoded[2]
+            if len(decoded) == 2:
+                return decoded[0], decoded[1], None
+            if len(decoded) == 1:
+                return decoded[0], None, None
+        return decoded, None, None
+
+    @staticmethod
+    def _unpack_coarse_decoder(decoded: Any) -> Tuple[Tensor, Optional[Tensor]]:
+        if isinstance(decoded, (tuple, list)):
+            if len(decoded) >= 2:
+                return decoded[0], decoded[1]
+            if len(decoded) == 1:
+                return decoded[0], None
+        return decoded, None
+
+    def _infer_embed_dim(self, default_embed_dim: Optional[int], robot_dim: int) -> int:
+        """Derive the encoder output dimensionality expected by ContextRSSM."""
+        if hasattr(self.encoder, "cnn_out_dim"):
+            img_dim = self.encoder.cnn_out_dim
+        elif hasattr(self.encoder, "out_dim"):
+            img_dim = self.encoder.out_dim
+        elif hasattr(self.encoder, "cnn_depth") and hasattr(self.encoder, "kernels"):
+            img_dim = self.encoder.cnn_depth * (2 ** (len(self.encoder.kernels) + 1))
+        else:
+            if default_embed_dim is None:
+                raise ValueError("Unable to infer encoder output dimension for ContextRSSM")
+            img_dim = default_embed_dim
+
+        embed_dim = img_dim
+        if self.with_proprio:
+            if hasattr(self.encoder, "state_out_dim"):
+                embed_dim += self.encoder.state_out_dim
+            else:
+                embed_dim += robot_dim
+
+        return embed_dim
+
+    def _encode_observations(self, rgb_s: Tensor, rgb_g: Optional[Tensor], s_obs: Tensor) -> Tensor:
+        """Run observations through the encoder, handling proprio optionality."""
+        if self.with_proprio:
+            try:
+                return self.encoder(rgb_s, rgb_g, s_obs)
+            except TypeError:
+                vision_embed = self.encoder(rgb_s, rgb_g)
+                return torch.cat((vision_embed, s_obs), dim=-1)
+        return self.encoder(rgb_s, rgb_g)
+
+    def on_train_epoch_start(self) -> None:
+        super(DreamerV2ContextRSSM, self).on_train_epoch_start()
+        self.in_state = self.crssm_core.init_state(self.train_batch_size)
+        self.train_step_history = []
+
+    def on_validation_epoch_start(self) -> None:
+        super(DreamerV2ContextRSSM, self).on_validation_epoch_start()
+        self.val_state = self.crssm_core.init_state(self.val_batch_size)
+        self.val_running_metrics: Dict[str, Tensor] = {}
+        self.num_val_batches = 0
+        self.val_gt_img_s: Optional[Tensor] = None
+        self.val_precise_img_s: Optional[Tensor] = None
+        self.val_coarse_img_s: Optional[Tensor] = None
+        self.val_gt_img_g: Optional[Tensor] = None
+        self.val_precise_img_g: Optional[Tensor] = None
+        self.val_coarse_img_g: Optional[Tensor] = None
+
+    # def dream(
+    #     self,
+    #     act: Tensor,
+    #     in_state: Tuple[Tensor, Tensor, Tensor],
+    #     temperature: float = 1.0,
+    # ) -> Tuple[Tensor, Tensor, Tuple[Tensor, Tensor, Tensor]]:
+    #     with self.autocast:
+    #         precise_prior, ctxt_prior, next_state = self.crssm_core.imagine_step(
+    #             act, in_state, temperature=temperature
+    #         )
+    #     return precise_prior, ctxt_prior, next_state
+
+
+    
+
+    
+    
+    def loss(self, batch: Dict[str, Tensor], outs: Dict[str, Tensor]) -> Dict[str, Tensor]:
+        # Reconstruction losses split by camera and decoder head
+        rgb_static = batch["rgb_obs"]["rgb_static"]
+        precise_static = outs["dcd_img_s"]
+        coarse_static = outs["coarse_rgb"]
+
+        loss_precise_static = 0.5 * torch.square(precise_static - rgb_static).sum(dim=[-1, -2, -3]) 
+        loss_coarse_static = 0.5 * torch.square(coarse_static - rgb_static).sum(dim=[-1, -2, -3]) 
+
+        loss_precise_static_mean = loss_precise_static.mean()
+        loss_coarse_static_mean = loss_coarse_static.mean()
+
+        rgb_gripper = batch["rgb_obs"]["rgb_gripper"]
+        precise_gripper = outs["dcd_img_g"]
+        coarse_gripper = outs["coarse_rgb_gripper"]
+
+        loss_precise_gripper = 0.5 * torch.square(precise_gripper - rgb_gripper).sum(dim=[-1, -2, -3]) 
+        loss_coarse_gripper = 0.5 * torch.square(coarse_gripper - rgb_gripper).sum(dim=[-1, -2, -3]) 
+
+        loss_precise_gripper_mean = loss_precise_gripper.mean()
+        loss_coarse_gripper_mean = loss_coarse_gripper.mean()
+
+        loss_precise_total = torch.stack([loss_precise_static_mean, loss_precise_gripper_mean]).mean()
+        loss_coarse_total = torch.stack([loss_coarse_static_mean, loss_coarse_gripper_mean]).mean()
+
+        recon_mean = loss_precise_total + loss_coarse_total
+
+        # KL Loss
+        post_logits = outs["posts"]
+        precise_prior_logits = outs["precise_priors"]
+        ctxt_prior_logits = outs["ctxt_priors"]
+
+        dpost = self.crssm_core.zdistr(post_logits)
+        dpost_detached = self.crssm_core.zdistr(post_logits.detach())
+        dprior_p = self.crssm_core.zdistr(precise_prior_logits)
+        dprior_p_detached = self.crssm_core.zdistr(precise_prior_logits.detach())
+        dprior_c = self.crssm_core.ctxt_zdistr(ctxt_prior_logits)
+        dprior_c_detached = self.crssm_core.ctxt_zdistr(ctxt_prior_logits.detach())
+
+        loss_kl_c_1 = D.kl.kl_divergence(dpost_detached, dprior_c).mean()
+        loss_kl_c_2 = D.kl.kl_divergence(dpost, dprior_c_detached).mean()
+
+        loss_kl_p_1 = D.kl.kl_divergence(dpost, dprior_p_detached).mean()
+        loss_kl_p_2 = D.kl.kl_divergence(dpost_detached, dprior_p).mean()
+
+        loss_kl_c = (1 - self.kl_balance) * loss_kl_c_1 + self.kl_balance * loss_kl_c_2
+        loss_kl_p = (1 - self.kl_balance) * loss_kl_p_1 + self.kl_balance * loss_kl_p_2
+
+        # Sparcity Loss
+
+        gates = outs["gates"]
+        gate_activity = gates.mean()
+        ctxt_sparsity = gate_activity
+        clamped_gates = st_clamp(gates)
+        gate_time_steps = clamped_gates.sum(dim=-1).mean() * gates.shape[0]
+
+
+        latent_entropy_post = dpost.entropy().mean()
+        latent_entropy_prior_p = dprior_p.entropy().mean()
+        latent_entropy_prior_c = dprior_c.entropy().mean()
+
+        # posterior_probs = dpost.base_dist.probs
+        # prior_probs = dprior_p.base_dist.probs
+        # ctxt_probs = dprior_c.base_dist.probs
+
+        # latent_var_post = posterior_probs.var(dim=-1).mean()
+        # latent_var_prior = prior_probs.var(dim=-1).mean()
+        # latent_var_ctxt = ctxt_probs.var(dim=-1).mean()
+
+
+        loss_gate_activity = self.gate_activity_weight * gate_activity
+        loss_ctxt_sparsity = self.ctxt_sparsity_weight * ctxt_sparsity
+
+        loss = (
+            self.kl_weight * (loss_kl_c + loss_kl_p)
+            + self.image_weight * recon_mean
+            + self.gate_activity_weight * loss_gate_activity
+            + self.ctxt_sparsity_weight * loss_ctxt_sparsity
+        )
+
+        metrics = {
+            "loss_total": loss,
+            "loss_reconstr": recon_mean,
+            "loss_precise": loss_precise_total,
+            "loss_precise-static": loss_precise_static_mean,
+            "loss_precise-gripper": loss_precise_gripper_mean,
+            "loss_coarse": loss_coarse_total,
+            "loss_coarse-static": loss_coarse_static_mean,
+            "loss_coarse-gripper": loss_coarse_gripper_mean,
+            "loss_kl-c": loss_kl_c,
+            "loss_kl-p": loss_kl_p,
+            "loss_gate-activity": loss_gate_activity,
+            "loss_ctxt-sparsity": loss_ctxt_sparsity,
+            "gate_activity": gate_activity,
+            "gate_sparsity": ctxt_sparsity,
+            "gate_time-steps": gate_time_steps,
+            "latent_entropy_post": latent_entropy_post,
+            "latent_entropy_precise_prior": latent_entropy_prior_p,
+            "latent_entropy_coarse_prior": latent_entropy_prior_c,
+            # "latent_var_post": latent_var_post,
+            # "latent_var_prior": latent_var_prior,
+            # "latent_var_ctxt": latent_var_ctxt,
+        }
+        return metrics
+    
+    def training_step(self, batch: Dict[str, Tensor], batch_idx: int) -> Dict[str, Union[Tensor, Any]]:
+        opt = self.optimizers()
+        opt.zero_grad()
+        # batch = batch["vis"]
+
+        with self.autocast:
+            rgb_g_input = batch["rgb_obs"].get("rgb_gripper")
+            current_batch_size = batch["rgb_obs"]["rgb_static"].shape[1]
+            self._ensure_state_batch_size("train", current_batch_size)
+            outs = self(
+                batch["rgb_obs"]["rgb_static"],
+                batch["robot_obs"],
+                batch["actions"]["pre_actions"],
+                batch["reset"],
+                self.in_state,
+                rgb_g=rgb_g_input,
+            )
+            losses = self.loss(batch, outs)
+
+        self.in_state = outs["out_states"]
+
+        self._record_train_step_metrics(losses)
+
+        log_interval = self.metric_log_interval if (self.metric_log_interval and self.metric_log_interval > 0) else None
+        if log_interval is None:
+            log_interval = self.metric_flush_size if (self.metric_flush_size and self.metric_flush_size > 0) else 1
+        should_flush = False
+        if log_interval > 0 and (self.global_step + 1) % log_interval == 0:
+            should_flush = True
+        if self.metric_flush_size and self.metric_flush_size > 0 and len(self.train_step_history) >= self.metric_flush_size:
+            should_flush = True
+        if should_flush:
+            self._flush_train_metrics()
+
+        should_log_images = False
+        if self.image_log_interval and self.image_log_interval > 0:
+            should_log_images = (self.global_step + 1) % self.image_log_interval == 0
+        else:
+            trainer_interval = getattr(self.trainer, "log_every_n_steps", None)
+            should_log_images = trainer_interval and trainer_interval > 0 and (
+                (self.global_step + 1) % trainer_interval == 0
+            )
+        if should_log_images and self.logger:
+            coarse_rgb = outs.get("coarse_rgb")
+            coarse_img_s = coarse_rgb[-1, 0] if coarse_rgb is not None else None
+
+            gt_img_g_val = None
+            precise_img_g_val = None
+            coarse_img_g_val = None
+
+            if self.use_gripper_camera:
+                rgb_gripper = batch["rgb_obs"].get("rgb_gripper")
+                if rgb_gripper is not None:
+                    gt_img_g_val = rgb_gripper[-1, 0]
+
+                precise_img_g = outs.get("dcd_img_g")
+                if precise_img_g is not None:
+                    precise_img_g_val = precise_img_g[-1, 0]
+
+                coarse_img_g = outs.get("coarse_rgb_gripper")
+                if coarse_img_g is not None:
+                    coarse_img_g_val = coarse_img_g[-1, 0]
+
+            self.log_images(
+                mode="train",
+                gt_img_s=batch["rgb_obs"]["rgb_static"][-1, 0],
+                precise_img_s=outs["dcd_img_s"][-1, 0],
+                coarse_img_s=coarse_img_s,
+                gt_img_g=gt_img_g_val,
+                precise_img_g=precise_img_g_val,
+                coarse_img_g=coarse_img_g_val,
+            )
+
+        self.scaler.scale(losses["loss_total"]).backward()
+        self.scaler.unscale_(opt)
+        grad_total_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), self.grad_clip)
+
+        if not isinstance(grad_total_norm, torch.Tensor):
+            grad_total_norm = torch.tensor(grad_total_norm, device=self.device)
+        losses["grad_total_norm"] = grad_total_norm.detach()
+
+        self.scaler.step(opt)
+        self.scaler.update()
+
+        return losses["loss_total"]
+
+    def on_train_epoch_end(self) -> None:
+        super(DreamerV2ContextRSSM, self).on_train_epoch_end()
+        self._flush_train_metrics()
+
+    def _ensure_state_batch_size(self, mode: str, batch_size: int) -> None:
+        if mode == "train":
+            state = getattr(self, "in_state", None)
+            if state is None or state[0].shape[0] != batch_size:
+                self.in_state = self.crssm_core.init_state(batch_size)
+        else:
+            state = getattr(self, "val_state", None)
+            if state is None or state[0].shape[0] != batch_size:
+                self.val_state = self.crssm_core.init_state(batch_size)
+
+    def validation_step(self, batch: Dict[str, Tensor], batch_idx: int) -> Dict[str, Union[Tensor, Any]]:
+        with self.autocast:
+            rgb_g_input = batch["rgb_obs"].get("rgb_gripper")
+            current_batch_size = batch["rgb_obs"]["rgb_static"].shape[1]
+            self._ensure_state_batch_size("val", current_batch_size)
+            outs = self(
+                batch["rgb_obs"]["rgb_static"],
+                batch["robot_obs"],
+                batch["actions"]["pre_actions"],
+                batch["reset"],
+                self.val_state,
+                rgb_g=rgb_g_input,
+            )
+            losses = self.loss(batch, outs)
+
+        self.val_state = outs["out_states"]
+
+        for key, val in losses.items():
+            detach_val = val.detach()
+            if key in self.val_running_metrics:
+                self.val_running_metrics[key] = self.val_running_metrics[key] + detach_val
+            else:
+                self.val_running_metrics[key] = detach_val
+        self.num_val_batches += 1
+
+        self.val_gt_img_s = batch["rgb_obs"]["rgb_static"][-1, 0]
+        self.val_precise_img_s = outs["dcd_img_s"][-1, 0]
+
+        coarse_rgb = outs.get("coarse_rgb")
+        self.val_coarse_img_s = coarse_rgb[-1, 0] if coarse_rgb is not None else None
+
+        self.val_gt_img_g = None
+        self.val_precise_img_g = None
+        self.val_coarse_img_g = None
+        if self.use_gripper_camera:
+            if rgb_g_input is not None:
+                self.val_gt_img_g = rgb_g_input[-1, 0]
+
+            precise_img_g = outs.get("dcd_img_g")
+            if precise_img_g is not None:
+                self.val_precise_img_g = precise_img_g[-1, 0]
+
+            coarse_img_g = outs.get("coarse_rgb_gripper")
+            if coarse_img_g is not None:
+                self.val_coarse_img_g = coarse_img_g[-1, 0]
+
+        return losses["loss_total"]
+
+    def on_validation_epoch_end(self) -> None:
+        if self.num_val_batches == 0:
+            return
+
+        averaged_metrics = {
+            key: val / float(self.num_val_batches) for key, val in self.val_running_metrics.items()
+        }
+        self.log_metrics(averaged_metrics, mode="val")
+
+        self.log_images(
+            mode="val",
+            gt_img_s=self.val_gt_img_s,
+            precise_img_s=self.val_precise_img_s,
+            coarse_img_s=self.val_coarse_img_s,
+            gt_img_g=self.val_gt_img_g,
+            precise_img_g=self.val_precise_img_g,
+            coarse_img_g=self.val_coarse_img_g,
+        )
+
+    def log_images(
+        self,
+        mode: str,
+        gt_img_s: Tensor,
+        precise_img_s: Tensor,
+        coarse_img_s: Optional[Tensor] = None,
+        gt_img_g: Optional[Tensor] = None,
+        precise_img_g: Optional[Tensor] = None,
+        coarse_img_g: Optional[Tensor] = None,
+    ) -> None:
+        if not self.logger:
+            return
+
+        datamodule = getattr(self.trainer, "datamodule", None)
+        transform: Optional[Callable[[Any], Any]] = None
+        if datamodule is not None:
+            train_transforms = getattr(datamodule, "train_transforms", {})
+            if isinstance(train_transforms, dict):
+                transform = train_transforms.get("out_rgb")
+
+        def tensor_to_uint8(arr_tensor: Tensor) -> np.ndarray:
+            data: Any = arr_tensor.to("cpu").detach()
+            if transform is not None:
+                try:
+                    data = transform(data)
+                except (AssertionError, TypeError):
+                    if torch.is_tensor(data):
+                        data = transform(data.cpu().numpy())
+                    else:
+                        data = transform(np.asarray(data))
+            if torch.is_tensor(data):
+                arr_np = data.to("cpu").detach().numpy()
+            else:
+                arr_np = np.asarray(data)
+            if arr_np.ndim == 3 and arr_np.shape[0] in (1, 3):
+                arr_np = np.transpose(arr_np, (1, 2, 0))
+            if arr_np.dtype != np.uint8:
+                max_val = float(np.max(arr_np)) if arr_np.size > 0 else 0.0
+                if max_val <= 1.0:
+                    arr_np = np.clip(arr_np * 255.0, 0, 255)
+                else:
+                    arr_np = np.clip(arr_np, 0, 255)
+                arr_np = arr_np.astype(np.uint8)
+            return arr_np
+
+        rgb_static_gt = tensor_to_uint8(gt_img_s)
+        rgb_static_precise = tensor_to_uint8(precise_img_s)
+
+        saved_images = [
+            ("rgb_static_gt", rgb_static_gt),
+            ("rgb_static_precise", rgb_static_precise),
+        ]
+
+        coarse_static = None
+        if coarse_img_s is not None:
+            coarse_static = tensor_to_uint8(coarse_img_s)
+            saved_images.append(("rgb_static_coarse", coarse_static))
+
+        step = int(self.global_step)
+        # if mode == "train" and step % self.image_log_interval != 0:
+        #    return
+
+        logger_name = self.logger.__class__.__name__.lower() if self.logger else ""
+        images = []
+        if "wandb" in logger_name:
+            images.append(wandb.Image(rgb_static_gt, caption="gt"))
+            images.append(wandb.Image(rgb_static_precise, caption="precise"))
+            if coarse_static is not None:
+                images.append(wandb.Image(coarse_static, caption="coarse"))
+
+        if gt_img_g is not None and precise_img_g is not None:
+            rgb_gripper_gt = tensor_to_uint8(gt_img_g)
+            rgb_gripper_precise = tensor_to_uint8(precise_img_g)
+            saved_images.extend(
+                [
+                    ("rgb_gripper_gt", rgb_gripper_gt),
+                    ("rgb_gripper_precise", rgb_gripper_precise),
+                ]
+            )
+
+            coarse_gripper = None
+            if coarse_img_g is not None:
+                coarse_gripper = tensor_to_uint8(coarse_img_g)
+                saved_images.append(("rgb_gripper_coarse", coarse_gripper))
+
+            if "wandb" in logger_name:
+                images.append(wandb.Image(rgb_gripper_gt, caption="gt_g"))
+                images.append(wandb.Image(rgb_gripper_precise, caption="precise_g"))
+                if coarse_gripper is not None:
+                    images.append(wandb.Image(coarse_gripper, caption="coarse_g"))
+
+        if "wandb" in logger_name:
+            self.logger.experiment.log({f"imgs/{mode}": images})
+            return
+
+        save_root = getattr(self.logger, "log_dir", None)
+        if save_root is None:
+            save_root = getattr(self.logger, "save_dir", None)
+        if save_root is None:
+            save_root = self.trainer.default_root_dir
+
+        save_path = Path(save_root) / "images" / mode
+        save_path.mkdir(parents=True, exist_ok=True)
+        for tag, arr in saved_images:
+            Image.fromarray(arr).save(save_path / f"{tag}_step{int(self.global_step)}.png")
+
+    @torch.no_grad()
+    def _flush_train_metrics(self) -> None:
+        if not self.train_step_history:
+            return
+        if self.logger:
+            for record in self.train_step_history:
+                step = int(record.get("global_step", int(self.global_step)))
+                aggregate_metrics = {}
+                for key, value in record.items():
+                    if key == "global_step":
+                        continue
+                    aggregate_metrics[key] = torch.tensor(value, device=self.device)
+                if aggregate_metrics:
+                    self.logger.log_metrics(
+                        {self._format_metric_key(k): v.detach().cpu().item() for k, v in aggregate_metrics.items()},
+                        step=step,
+                    )
+        self.train_step_history = []
+
+    @torch.no_grad()
+    def _record_train_step_metrics(self, metrics: Dict[str, Tensor]) -> None:
+        step_record: Dict[str, float] = {"global_step": float(int(self.global_step))}
+        for key, val in metrics.items():
+            step_record[key] = float(val.detach().to("cpu"))
+        self.train_step_history.append(step_record)
+
+    def _format_metric_key(self, key: str) -> str:
+        info = key.split("_")
+        if len(info) >= 2:
+            return f"{info[0]}/train-{info[1]}"
+        return f"{key}/train"

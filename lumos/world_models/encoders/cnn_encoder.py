@@ -1,7 +1,9 @@
 from typing import List
+
 import torch
 from torch import nn
-from lumos.utils.nn_utils import get_activation, flatten_batch, unflatten_batch
+
+from lumos.utils.nn_utils import flatten_batch, get_activation, unflatten_batch
 
 
 class CnnEncoder(nn.Module):
@@ -9,52 +11,61 @@ class CnnEncoder(nn.Module):
         self,
         cnn_depth: int,
         kernels: List[int],
-        stride: int,
+        strides: List[int],
+        paddings: List[int],
         activation: str,
+        use_gripper_camera: bool,
     ):
         super(CnnEncoder, self).__init__()
         self.in_dim = 3
         self.cnn_depth = cnn_depth
         self.kernels = kernels
-        self.stride = stride
+        self.strides = strides
+        self.paddings = paddings
         self.activation = get_activation(activation)
+        self.use_gripper_camera = use_gripper_camera
+        self.out_dim = self.cnn_depth * (2 ** (len(self.kernels) + 1))
 
-        self.out_dim = cnn_depth * 32
+        self.encoder_static = self._make_encoder_layers()
 
-        self.encoder_static = nn.Sequential(
-            nn.Conv2d(self.in_dim, self.cnn_depth, self.kernels[0], self.stride),
-            self.activation,
-            nn.Conv2d(self.cnn_depth, self.cnn_depth * 2, self.kernels[1], self.stride),
-            self.activation,
-            nn.Conv2d(self.cnn_depth * 2, self.cnn_depth * 4, self.kernels[2], self.stride),
-            self.activation,
-            nn.Conv2d(self.cnn_depth * 4, self.cnn_depth * 8, self.kernels[3], self.stride),
-            self.activation,
-            nn.Flatten(),
-        )
+        if self.use_gripper_camera:
+            self.encoder_gripper = self._make_encoder_layers()
+            self.fuse = nn.Sequential(
+                nn.Linear(self.out_dim * 2, self.out_dim), nn.LayerNorm(self.out_dim, eps=1e-3), self.activation
+            )
 
-        self.encoder_gripper = nn.Sequential(
-            nn.Conv2d(self.in_dim, self.cnn_depth, self.kernels[0], self.stride),
-            self.activation,
-            nn.Conv2d(self.cnn_depth, self.cnn_depth * 2, self.kernels[1], self.stride),
-            self.activation,
-            nn.Conv2d(self.cnn_depth * 2, self.cnn_depth * 4, self.kernels[2], self.stride),
-            self.activation,
-            nn.Conv2d(self.cnn_depth * 4, self.cnn_depth * 8, self.kernels[3], self.stride),
-            self.activation,
-            nn.Flatten(),
-        )
+    def _make_encoder_layers(self):
+        layers = []
+        in_channels = self.in_dim
 
-        self.fuse = nn.Sequential(
-            nn.Linear(self.out_dim * 2, self.out_dim), nn.LayerNorm(self.out_dim, eps=1e-3), self.activation
-        )
+        for i in range(len(self.kernels)):
+            out_channels = self.cnn_depth * (2**i)
+            layers.append(
+                nn.Conv2d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=self.kernels[i],
+                    stride=self.strides[i],
+                    padding=self.paddings[i],
+                )
+            )
+            layers.append(self.activation)
+            in_channels = out_channels
+
+        layers.append(nn.Flatten())
+        return nn.Sequential(*layers)
 
     def forward(self, x_s, x_g):
         x_s, bd = flatten_batch(x_s, 3)
-        x_g, bd = flatten_batch(x_g, 3)
         y_s = self.encoder_static(x_s)
-        y_g = self.encoder_gripper(x_g)
-        y = torch.cat([y_s, y_g], dim=1)
-        y = self.fuse(y)
+
+        if x_g is not None:
+            x_g, _ = flatten_batch(x_g, 3)
+            y_g = self.encoder_gripper(x_g)
+            y_combined = torch.cat([y_s, y_g], dim=1)
+            y = self.fuse(y_combined)
+        else:
+            y = y_s
+
         y = unflatten_batch(y, bd)
         return y

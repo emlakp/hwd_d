@@ -1,5 +1,5 @@
-"""'LUMOS: Language-Conditioned Imitation Learning with World Models implementation in pytorch
-:copyright: 2024 by ...
+"""LUMOS: Language-Conditioned Imitation Learning with World Models implementation in pytorch
+:copyright: 2025 by ...
 :license: MIT, see LICENSE for more details.
 """
 

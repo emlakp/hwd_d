@@ -1,0 +1,6 @@
+defaults:
+  - vision_wm
+
+_target_: lumos.datasets.vision_wm_disk_dataset.VisionWMDiskDataset
+use_cached_data: false
+num_workers: 40

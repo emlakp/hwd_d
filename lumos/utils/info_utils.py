@@ -1,15 +1,16 @@
 import os
-import hydra
 from pathlib import Path
 from typing import Dict, List, Union
+
 import git
+import hydra
+from lightning.pytorch.loggers import Logger
 import numpy as np
+from omegaconf import DictConfig
 import pytorch_lightning
+from pytorch_lightning import Callback
 import torch
 import tqdm
-from omegaconf import DictConfig
-from pytorch_lightning import Callback
-from pytorch_lightning.loggers import Logger
 
 
 def get_git_commit_hash(repo_path: Path) -> str:
@@ -112,3 +113,43 @@ def setup_callbacks(callbacks_cfg: DictConfig) -> List[Callback]:
     """
     callbacks = [hydra.utils.instantiate(cb) for cb in callbacks_cfg.values()]
     return callbacks
+
+
+def setup_tensor_cores(enabled=True, precision="high"):
+    """
+    Check if the current CUDA device has Tensor Cores and set appropriate matmul precision.
+
+    Args:
+        enabled (bool): Whether to enable Tensor Core optimization
+        precision (str): One of 'highest', 'high', or 'medium' for matmul precision
+
+    Returns:
+        bool: True if Tensor Cores are available and precision was set, False otherwise
+    """
+    if not enabled or not torch.cuda.is_available():
+        return False
+
+    # Get the current device architecture
+    device = torch.cuda.current_device()
+    capability = torch.cuda.get_device_capability(device)
+    major, minor = capability
+
+    # Tensor Cores are available on:
+    # - Volta (7.0) and Turing (7.5) with mixed precision
+    # - Ampere (8.0+) with both FP32 and mixed precision
+    has_tensor_cores = (major == 7 and minor in [0, 5]) or (major >= 8)  # Volta and Turing  # Ampere and newer
+
+    if has_tensor_cores:
+        # Validate precision setting
+        if precision not in ["highest", "high", "medium"]:
+            precision = "high"  # Default to high if invalid
+
+        # For Ampere and newer (8.0+), we can use any precision
+        # For Volta/Turing (7.x), we can only use 'medium'
+        if major < 8 and precision != "medium":
+            precision = "medium"
+
+        torch.set_float32_matmul_precision(precision)
+        return True
+
+    return False

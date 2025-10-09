@@ -1,13 +1,15 @@
 hydra-core
 hydra-colorlog
-torch==1.13.1
+torch
 torchvision
 torchmetrics
-pytorch-lightning==1.8.6
+lightning
 transformers
 numpy
 matplotlib
 opencv-python
 tqdm
 wandb
+timm==0.9.10
 mmh3
+

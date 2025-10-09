@@ -1,0 +1,5 @@
+defaults:
+  - default
+
+metric_log_interval: 500
+metric_flush_size: 500

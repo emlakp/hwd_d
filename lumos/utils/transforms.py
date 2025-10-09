@@ -1,6 +1,5 @@
-import torch
 import numpy as np
-
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -69,9 +68,11 @@ class NormalizeVector(object):
     """Normalize a tensor vector with mean and standard deviation."""
 
     def __init__(self, mean=0.0, std=1.0):
-        self.std = torch.Tensor(std)
-        self.std[self.std == 0.0] = 1.0
-        self.mean = torch.Tensor(mean)
+        self.std = torch.as_tensor(std, dtype=torch.float32).clone()
+        if self.std.numel() == 0:
+            self.std = torch.tensor(1.0, dtype=torch.float32)
+        self.std = torch.where(self.std == 0.0, torch.ones_like(self.std), self.std)
+        self.mean = torch.as_tensor(mean, dtype=torch.float32).clone()
 
     def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
         assert isinstance(tensor, torch.Tensor)
@@ -79,3 +80,38 @@ class NormalizeVector(object):
 
     def __repr__(self):
         return self.__class__.__name__ + "(mean={0}, std={1})".format(self.mean, self.std)
+
+
+class Identity(object):
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        return tensor
+
+
+class NormalizeVectorMinMax(object):
+    """Normalize a tensor vector with max and min values."""
+
+    def __init__(self, min, max):
+        self.min = torch.as_tensor(min)
+        self.max = torch.as_tensor(max)
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        assert isinstance(tensor, torch.Tensor)
+        return (tensor - self.min) / (self.max - self.min)
+
+    def __repr__(self):
+        return self.__class__.__name__ + "(min={0}, max={1})".format(self.min, self.max)
+
+
+class UnnormalizeVectorMinMax(object):
+    """Unnormalize a tensor vector with max and min values."""
+
+    def __init__(self, min, max):
+        self.min = torch.as_tensor(min)
+        self.max = torch.as_tensor(max)
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        assert isinstance(tensor, torch.Tensor)
+        return tensor * (self.max - self.min) + self.min
+
+    def __repr__(self):
+        return self.__class__.__name__ + "(min={0}, max={1})".format(self.min, self.max)

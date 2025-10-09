@@ -1,12 +1,14 @@
+from typing import Optional, Tuple
+
 import hydra
 from omegaconf import DictConfig
 import torch
+from torch import Tensor
 import torch.distributions as D
 import torch.nn as nn
 import torch.nn.functional as F
-from torch import Tensor
+
 from lumos.utils.nn_utils import NoNorm
-from typing import Optional, Tuple
 
 
 class RSSMCell(nn.Module):

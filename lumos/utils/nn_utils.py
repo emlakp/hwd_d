@@ -1,6 +1,7 @@
+from typing import Tuple, Union
+
 import torch
 from torch import nn
-from typing import Tuple, Union
 
 
 def get_activation(activation: str):
@@ -16,6 +17,12 @@ def get_activation(activation: str):
         return nn.Softmax(dim=1)
     else:
         raise NotImplementedError
+
+
+def st_clamp(x):
+    x_clamped = x.clamp(0.0, 1.0)
+    # forward = x_clamped, backward dL/dx = dL/d(x) (identity)
+    return x + (x_clamped - x).detach()
 
 
 def init_weights(m):
@@ -57,7 +64,65 @@ def transpose_collate_wm(batch):
         if key in nested_fields:
             transposed_batch[key] = {}
             for sub_key in nested_fields[key]:
-                transposed_batch[key][sub_key] = torch.transpose(value[sub_key], 0, 1)
+                if sub_key in value:
+                    transposed_batch[key][sub_key] = torch.transpose(value[sub_key], 0, 1)
+        elif key in fields:
+            transposed_batch[key] = torch.transpose(value, 0, 1)
+        else:
+            transposed_batch[key] = value
+
+    return transposed_batch
+
+
+def transpose_collate_hybrid_wm(batch):
+    """transposes batch and time dimension
+    (B, T, ...) -> (T, B, ...)"""
+    from torch.utils.data._utils.collate import default_collate
+
+    collated_batch = default_collate(batch)
+    transposed_batch = {}
+
+    fields = ["reset", "state_obs", "frame"]
+    nested_fields = {
+        "rgb_obs": ["rgb_static", "rgb_gripper"],
+        "state_info": ["robot_obs", "pre_robot_obs"],
+        "actions": ["rel_actions", "pre_actions"],
+    }
+
+    for key, value in collated_batch.items():
+        if key in nested_fields:
+            transposed_batch[key] = {}
+            for sub_key in nested_fields[key]:
+                if sub_key in value:
+                    transposed_batch[key][sub_key] = torch.transpose(value[sub_key], 0, 1)
+        elif key in fields:
+            transposed_batch[key] = torch.transpose(value, 0, 1)
+        else:
+            transposed_batch[key] = value
+
+    return transposed_batch
+
+
+def transpose_collate_state_wm(batch):
+    """transposes batch and time dimension
+    (B, T, ...) -> (T, B, ...)"""
+    from torch.utils.data._utils.collate import default_collate
+
+    collated_batch = default_collate(batch)
+    transposed_batch = {}
+
+    fields = ["reset", "state_obs", "frame"]
+    nested_fields = {
+        "state_info": ["robot_obs", "pre_robot_obs"],
+        "actions": ["rel_actions", "pre_actions"],
+    }
+
+    for key, value in collated_batch.items():
+        if key in nested_fields:
+            transposed_batch[key] = {}
+            for sub_key in nested_fields[key]:
+                if sub_key in value:
+                    transposed_batch[key][sub_key] = torch.transpose(value[sub_key], 0, 1)
         elif key in fields:
             transposed_batch[key] = torch.transpose(value, 0, 1)
         else:
@@ -116,7 +181,6 @@ def unflatten_batch(x: torch.Tensor, batch_dim: Union[torch.Size, Tuple]) -> tor
 
 
 class NoNorm(nn.Module):
-
     def __init__(self, *args, **kwargs):
         super().__init__()
 

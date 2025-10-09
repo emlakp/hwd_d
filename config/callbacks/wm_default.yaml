@@ -1,2 +1,2 @@
 defaults:
-  - checkpoint: wm
+  - checkpoint: wm_debug

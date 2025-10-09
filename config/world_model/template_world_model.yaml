@@ -1,0 +1,16 @@
+defaults:
+  - amp: default
+  - optimizer: adamw
+  - loss: default
+
+_target_: lumos.world_models.template_world_model.TemplateWorldModel
+_recursive_: false
+
+name: template_world_model
+train_batch_size: 16
+val_batch_size: 16
+
+# Override these from an experiment config before instantiating the model.
+encoder: null        # e.g. ${world_model.encoder}
+dynamics: null       # e.g. ${world_model.dynamics}
+decoder: null        # e.g. ${world_model.decoder}
