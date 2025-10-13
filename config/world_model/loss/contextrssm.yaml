@@ -4,4 +4,4 @@ context_kl_weight: 1.0
 image_weight: 1.0
 grad_clip: 100
 gate_activity_weight: 0.0
-ctxt_sparsity_weight: 1.0
+ctxt_sparsity_weight: 20.0
