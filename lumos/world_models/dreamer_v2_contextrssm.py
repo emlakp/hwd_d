@@ -383,14 +383,15 @@ class DreamerV2ContextRSSM(WorldModel):
     def training_step(self, batch: Dict[str, Tensor], batch_idx: int) -> Dict[str, Union[Tensor, Any]]:
         opt = self.optimizers()
         opt.zero_grad()
-        # batch = batch["vis"]
+
+        rgb_static = batch["rgb_obs"]["rgb_static"]
+        rgb_g_input = batch["rgb_obs"].get("rgb_gripper")
+        current_batch_size = rgb_static.shape[1]
+        self._ensure_state_batch_size("train", current_batch_size)
 
         with self.autocast:
-            rgb_g_input = batch["rgb_obs"].get("rgb_gripper")
-            current_batch_size = batch["rgb_obs"]["rgb_static"].shape[1]
-            self._ensure_state_batch_size("train", current_batch_size)
             outs = self(
-                batch["rgb_obs"]["rgb_static"],
+                rgb_static,
                 batch["robot_obs"],
                 batch["actions"]["pre_actions"],
                 batch["reset"],
@@ -402,67 +403,11 @@ class DreamerV2ContextRSSM(WorldModel):
         self.in_state = outs["out_states"]
 
         self._record_train_step_metrics(losses)
-
-        log_interval = self.metric_log_interval if (self.metric_log_interval and self.metric_log_interval > 0) else None
-        if log_interval is None:
-            log_interval = self.metric_flush_size if (self.metric_flush_size and self.metric_flush_size > 0) else 1
-        should_flush = False
-        if log_interval > 0 and (self.global_step + 1) % log_interval == 0:
-            should_flush = True
-        if self.metric_flush_size and self.metric_flush_size > 0 and len(self.train_step_history) >= self.metric_flush_size:
-            should_flush = True
-        if should_flush:
+        if self._should_flush_train_metrics():
             self._flush_train_metrics()
 
-        should_log_images = False
-        if self.image_log_interval and self.image_log_interval > 0:
-            should_log_images = (self.global_step + 1) % self.image_log_interval == 0
-        else:
-            trainer_interval = getattr(self.trainer, "log_every_n_steps", None)
-            should_log_images = trainer_interval and trainer_interval > 0 and (
-                (self.global_step + 1) % trainer_interval == 0
-            )
-        if should_log_images and self.logger:
-            coarse_rgb = outs.get("coarse_rgb")
-            coarse_img_s = coarse_rgb[-1, 0] if coarse_rgb is not None else None
-
-            gt_img_g_val = None
-            precise_img_g_val = None
-            coarse_img_g_val = None
-
-            if self.use_gripper_camera:
-                rgb_gripper = batch["rgb_obs"].get("rgb_gripper")
-                if rgb_gripper is not None:
-                    gt_img_g_val = rgb_gripper[-1, 0]
-
-                precise_img_g = outs.get("dcd_img_g")
-                if precise_img_g is not None:
-                    precise_img_g_val = precise_img_g[-1, 0]
-
-                coarse_img_g = outs.get("coarse_rgb_gripper")
-                if coarse_img_g is not None:
-                    coarse_img_g_val = coarse_img_g[-1, 0]
-
-            self.log_images(
-                mode="train",
-                gt_img_s=batch["rgb_obs"]["rgb_static"][-1, 0],
-                precise_img_s=outs["dcd_img_s"][-1, 0],
-                coarse_img_s=coarse_img_s,
-                gt_img_g=gt_img_g_val,
-                precise_img_g=precise_img_g_val,
-                coarse_img_g=coarse_img_g_val,
-            )
-
-        self.scaler.scale(losses["loss_total"]).backward()
-        self.scaler.unscale_(opt)
-        grad_total_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), self.grad_clip)
-
-        if not isinstance(grad_total_norm, torch.Tensor):
-            grad_total_norm = torch.tensor(grad_total_norm, device=self.device)
-        losses["grad_total_norm"] = grad_total_norm.detach()
-
-        self.scaler.step(opt)
-        self.scaler.update()
+        self._maybe_log_train_images(batch, outs)
+        self._step_with_scaler(opt, losses["loss_total"], losses)
 
         return losses["loss_total"]
 
@@ -684,3 +629,83 @@ class DreamerV2ContextRSSM(WorldModel):
         if len(info) >= 2:
             return f"{info[0]}/train-{info[1]}"
         return f"{key}/train"
+
+    def _should_flush_train_metrics(self) -> bool:
+        if not self.train_step_history:
+            return False
+
+        step = int(self.global_step) + 1
+        if self.metric_flush_size and self.metric_flush_size > 0:
+            if len(self.train_step_history) >= self.metric_flush_size:
+                return True
+
+        interval = None
+        if self.metric_log_interval and self.metric_log_interval > 0:
+            interval = self.metric_log_interval
+        elif self.metric_flush_size and self.metric_flush_size > 0:
+            interval = self.metric_flush_size
+
+        if interval and interval > 0:
+            return step % interval == 0
+
+        return True
+
+    def _should_log_images(self) -> bool:
+        if not self.logger:
+            return False
+
+        step = int(self.global_step) + 1
+        if self.image_log_interval and self.image_log_interval > 0:
+            return step % self.image_log_interval == 0
+
+        trainer_interval = getattr(self.trainer, "log_every_n_steps", None)
+        return bool(trainer_interval and trainer_interval > 0 and step % trainer_interval == 0)
+
+    def _maybe_log_train_images(self, batch: Dict[str, Tensor], outs: Dict[str, Tensor]) -> None:
+        if not self._should_log_images():
+            return
+
+        coarse_rgb = outs.get("coarse_rgb")
+        coarse_img_s = coarse_rgb[-1, 0] if coarse_rgb is not None else None
+
+        gt_img_g_val = None
+        precise_img_g_val = None
+        coarse_img_g_val = None
+
+        if self.use_gripper_camera:
+            rgb_gripper = batch["rgb_obs"].get("rgb_gripper")
+            if rgb_gripper is not None:
+                gt_img_g_val = rgb_gripper[-1, 0]
+
+            precise_img_g = outs.get("dcd_img_g")
+            if precise_img_g is not None:
+                precise_img_g_val = precise_img_g[-1, 0]
+
+            coarse_img_g = outs.get("coarse_rgb_gripper")
+            if coarse_img_g is not None:
+                coarse_img_g_val = coarse_img_g[-1, 0]
+
+        self.log_images(
+            mode="train",
+            gt_img_s=batch["rgb_obs"]["rgb_static"][-1, 0],
+            precise_img_s=outs["dcd_img_s"][-1, 0],
+            coarse_img_s=coarse_img_s,
+            gt_img_g=gt_img_g_val,
+            precise_img_g=precise_img_g_val,
+            coarse_img_g=coarse_img_g_val,
+        )
+
+    def _step_with_scaler(
+        self, opt: torch.optim.Optimizer, total_loss: Tensor, losses: Dict[str, Tensor]
+    ) -> None:
+        """Apply gradient scaling, clipping, and optimizer step."""
+        self.scaler.scale(total_loss).backward()
+        self.scaler.unscale_(opt)
+        grad_total_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), self.grad_clip)
+
+        if not isinstance(grad_total_norm, torch.Tensor):
+            grad_total_norm = torch.tensor(grad_total_norm, device=self.device)
+        losses["grad_total_norm"] = grad_total_norm.detach()
+
+        self.scaler.step(opt)
+        self.scaler.update()
