@@ -124,7 +124,7 @@ def create_dataloader(cfg: DictConfig, train_tfms: Dict) -> Tuple[VisionWMDiskDa
     dataset_cfg = cfg.datamodule.datasets.vision_dataset
 
     # batch_size = cfg.datamodule.batch_size
-    batch_size = 8
+    batch_size = 32
     available = multiprocessing.cpu_count()
     OmegaConf.set_struct(dataset_cfg, False)
     dataset_cfg.num_workers = min(max(1, available - 1), 8)

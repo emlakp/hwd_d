@@ -97,11 +97,13 @@ def setup_logger(cfg: DictConfig) -> Logger:
     if not cfg.logger:
         return None
     date_time = "_".join(cfg.exp_dir.split("/")[-2:])
-    if cfg.comment != "":
-        cfg.logger.name = "%s_%s" % (cfg.comment, date_time)
-    else:
-        cfg.logger.name = date_time
-    cfg.logger.id = cfg.logger.name.replace("/", "_")
+    if "name" in cfg.logger:
+        if cfg.comment != "":
+            cfg.logger.name = "%s_%s" % (cfg.comment, date_time)
+        else:
+            cfg.logger.name = date_time
+    if "id" in cfg.logger:
+        cfg.logger.id = cfg.logger.name.replace("/", "_")
     logger = hydra.utils.instantiate(cfg.logger)
 
     return logger

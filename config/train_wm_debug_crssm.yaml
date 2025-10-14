@@ -4,7 +4,7 @@ defaults:
   - datamodule: wm_debug_crssm
   - world_model: dreamer_v2_contextrssm_debug
   - trainer: wm_overfit_debug
-  - logger: none
+  - logger: csv
   - _self_
 
   - override hydra/job_logging: colorlog
