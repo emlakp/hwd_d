@@ -9,10 +9,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from lumos.utils.nn_utils import NoNorm
-from lumos.world_models.contextrssm.gatel0rd import GateL0RDCell
 
 
-class ContextRSSMCell(nn.Module):
+class ContextLSTMCell(nn.Module):
+    """
+    Context RSSM cell using a simple LSTM instead of GateL0RD for context dynamics.
+
+    This cell replaces the GateL0RDCell with a standard LSTM, removing the gating
+    mechanism while maintaining the same overall architecture.
+    """
+
     def __init__(
         self,
         embed_dim: int,
@@ -25,7 +31,6 @@ class ContextRSSMCell(nn.Module):
         ensemble: int = 5,
         gru: DictConfig = None,
         layer_norm: bool = True,
-        context_sample_noise: float = 0.05,
         ablate_context: bool = False,
     ):
         super().__init__()
@@ -54,14 +59,11 @@ class ContextRSSMCell(nn.Module):
         self.init_z = nn.Parameter(torch.zeros(self.stoch_dim * self.stoch_rank))
         self.init_context = nn.Parameter(torch.zeros(self.context_dim))
 
-        # Context dynamics via GateL0RD
-        self.context_rnn = GateL0RDCell(
-            input_size=self.hidden_dim,
-            hidden_size=self.context_dim,
-            reg_lambda=0.01,
-            output_size=self.context_dim,
-            gate_noise_level=context_sample_noise,
-        )
+        # Context dynamics via simple LSTM
+        self.context_lstm = nn.LSTMCell(self.hidden_dim, self.context_dim)
+
+        # LSTM cell state (will be managed separately)
+        self.init_cell_state = nn.Parameter(torch.zeros(self.context_dim))
 
         self.z_mlp = nn.Linear(self.stoch_dim * (self.stoch_rank or 1), self.hidden_dim)
         self.a_mlp = nn.Linear(self.action_dim, self.hidden_dim, bias=False)
@@ -146,22 +148,25 @@ class ContextRSSMCell(nn.Module):
         h = torch.tile(self.init_h, (batch_size, 1)).to(device)
         z = torch.tile(self.init_z, (batch_size, 1)).to(device)
         context = torch.tile(self.init_context, (batch_size, 1)).to(device)
-        return h, z, context
+        cell_state = torch.tile(self.init_cell_state, (batch_size, 1)).to(device)
+        # Return (h, z, context, cell_state) - adding cell_state for LSTM
+        return h, z, context, cell_state
 
     def forward(
         self,
         action: Tensor,
-        in_state: Tuple[Tensor, Tensor, Tensor],
+        in_state: Tuple[Tensor, Tensor, Tensor, Tensor],
         reset_mask: Optional[Tensor] = None,
         embed: Optional[Tensor] = None,
         temperature: float = 1.0,
     ):
-        in_h, in_z, in_context = in_state
+        in_h, in_z, in_context, in_cell_state = in_state
         if reset_mask is not None:
             reset_mask = reset_mask.unsqueeze(-1)
             in_h = in_h * reset_mask
             in_z = in_z * reset_mask
             in_context = in_context * reset_mask
+            in_cell_state = in_cell_state * reset_mask
 
         batch_size = action.shape[0]
 
@@ -169,14 +174,9 @@ class ContextRSSMCell(nn.Module):
         x = self.z_mlp(in_z) + self.a_mlp(action)
         x = self.in_norm(x)
         za = F.elu(x)
-        
 
-        action_shape = action.shape
-        in_z_shape = in_z.shape
-        za_shape = za.shape
-        
-        # Сoarse dynamics
-        _, context, gates = self.context_rnn(za, in_context)
+        # Context dynamics using LSTM
+        context, cell_state = self.context_lstm(za, (in_context, in_cell_state))
 
         # Ablation: zero out context if ablate_context is True
         if self.ablate_context:
@@ -211,15 +211,18 @@ class ContextRSSMCell(nn.Module):
         ctxt_hidden_prior = self.ctxt_head(ctxt_inp_prior)
         ctxt_prior_index = torch.randint(0, self.ensemble, (), device=action.device)
         ctxt_prior_logits = self.ctxt_ensemble[ctxt_prior_index](ctxt_hidden_prior)
-        
+
         ctxt_prior_dist = self.zdistr(ctxt_prior_logits, temperature)
         ctxt_prior_sample = ctxt_prior_dist.rsample().reshape(batch_size, -1)
+
+        # Create dummy gates (all ones) for compatibility with ContextRSSM interface
+        dummy_gates = torch.ones((batch_size, self.context_dim), device=action.device)
 
         return (
             (precise_prior_logits, ctxt_prior_logits, posterior_logits),
             (precise_prior_sample, ctxt_prior_sample, posterior_sample),
-            (context, h, posterior_sample),
-            gates
+            (context, h, posterior_sample, cell_state),  # Include cell_state in output
+            dummy_gates  # Return dummy gates instead of real gates
         )
 
     def zdistr(self, pp: Tensor, temperature: float = 1.0) -> D.Distribution:
@@ -230,20 +233,3 @@ class ContextRSSMCell(nn.Module):
 
     def ctxt_zdistr(self, pp: Tensor, temperature: float = 1.0) -> D.Distribution:
         return self.zdistr(pp, temperature)
-
-
-# if __name__ == "__main__":
-#     cell = ContextRSSMCell(
-#         embed_dim=32,
-#         action_dim=4,
-#         deter_dim=64,
-#         stoch_dim=8,
-#         stoch_rank=16,
-#         context_dim=16,
-#         hidden_dim=32,
-#     )
-#     action = torch.randn(5, 4)
-#     embed = torch.randn(5, 32)
-#     state = cell.init_state(5)
-#     outputs = cell(action, state, embed=embed)
-#     assert len(outputs) == 5

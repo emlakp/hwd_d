@@ -6,7 +6,7 @@ import git
 import hydra
 from lightning.pytorch.loggers import Logger
 import numpy as np
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 import pytorch_lightning
 from pytorch_lightning import Callback
 import torch
@@ -105,6 +105,16 @@ def setup_logger(cfg: DictConfig) -> Logger:
     if "id" in cfg.logger:
         cfg.logger.id = cfg.logger.name.replace("/", "_")
     logger = hydra.utils.instantiate(cfg.logger)
+
+    # Log the full config to wandb
+    if logger and hasattr(logger, 'experiment'):
+        logger_name = logger.__class__.__name__.lower()
+        if 'wandb' in logger_name:
+            import wandb
+            # Convert OmegaConf to dict and log to wandb
+            config_dict = OmegaConf.to_container(cfg, resolve=True)
+            wandb.config.update(config_dict, allow_val_change=True)
+            print(f"Logged full config to wandb run: {logger.experiment.name}")
 
     return logger
 

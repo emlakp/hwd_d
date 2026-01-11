@@ -1,0 +1,5 @@
+defaults:
+  - cell: contextlstm
+
+_target_: lumos.world_models.contextrssm.lstm_core.ContextLSTMCore
+_recursive_: false

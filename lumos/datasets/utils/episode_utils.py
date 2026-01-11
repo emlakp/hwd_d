@@ -172,6 +172,18 @@ def get_state_info_dict(episode: Dict[str, np.ndarray], for_wm: bool) -> Dict[st
     }
     if for_wm:
         info["state_info"]["pre_robot_obs"] = torch.from_numpy(episode["pre_robot_obs"])
+        # Always add current_task_ids to maintain consistent batch structure
+        if "current_task_ids" in episode:
+            task_ids = episode["current_task_ids"]
+            # Ensure it has the right shape [seq_len, 1]
+            if task_ids.ndim == 1:
+                task_ids = task_ids.reshape(-1, 1)
+            info["state_info"]["current_task_ids"] = torch.from_numpy(task_ids)
+        else:
+            # Create placeholder with -1 if current_task_ids doesn't exist
+            # Match the shape [seq_len, 1] from actual data
+            seq_len = episode["robot_obs"].shape[0]
+            info["state_info"]["current_task_ids"] = torch.full((seq_len, 1), -1, dtype=torch.long)
     return info
 
 

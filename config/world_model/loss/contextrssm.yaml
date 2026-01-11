@@ -4,4 +4,13 @@ context_kl_weight: 1.0
 image_weight: 1.0
 grad_clip: 100
 gate_activity_weight: 0.0
-ctxt_sparsity_weight: 20.0
+ctxt_sparsity_weight: 35
+task_weight: 20.0
+num_tasks: 34  # Number of discrete tasks for the context classification head
+
+# Context tracking options (all default to False)
+track_context_changes: true        # Track L2 distance between consecutive timesteps
+track_context_variance: true       # Track temporal variance of context
+track_context_update_freq: true    # Track how often context significantly changes
+log_context_heatmaps: true         # Log images before/after significant context changes
+context_change_threshold: 0.1      # Threshold for "significant" context change

@@ -19,7 +19,7 @@ import wandb
 
 from lumos.utils.nn_utils import init_weights, st_clamp
 from lumos.world_models.world_model import WorldModel
-from lumos.world_models.contextrssm.core import ContextRSSMCore
+from lumos.world_models.contextrssm.lstm_core import ContextLSTMCore
 
 logger = logging.getLogger(__name__)
 
@@ -29,16 +29,17 @@ def log_rank_0(*args, **kwargs):
     logger.info(*args, **kwargs)
 
 
-class DreamerV2ContextRSSM(WorldModel):
+class DreamerV2LSTM(WorldModel):
     """
-    The lightning module used for training DreamerV2 with Context RSSM.
+    The lightning module used for training DreamerV2 with LSTM-based context.
+    This variant replaces GateL0RD with a simple LSTM for context dynamics.
     """
 
     def __init__(
         self,
         encoder: DictConfig,
         decoder: DictConfig,
-        crssm: DictConfig,
+        lstm: DictConfig,
         amp: DictConfig,
         optimizer: DictConfig,
         loss: DictConfig,
@@ -49,28 +50,28 @@ class DreamerV2ContextRSSM(WorldModel):
         robot_dim: int,
         name: str,
     ):
-        super(DreamerV2ContextRSSM, self).__init__(name=name)
+        super(DreamerV2LSTM, self).__init__(name=name)
         self.use_gripper_camera = use_gripper_camera
 
         self.encoder = hydra.utils.instantiate(encoder)
 
-        self.deter_dim = crssm.cell.deter_dim
-        self.stoch_dim_total = crssm.cell.stoch_dim * (crssm.cell.stoch_rank or 1)
-        self.context_dim = crssm.cell.context_dim
+        self.deter_dim = lstm.cell.deter_dim
+        self.stoch_dim_total = lstm.cell.stoch_dim * (lstm.cell.stoch_rank or 1)
+        self.context_dim = lstm.cell.context_dim
         precise_in_dim = self.deter_dim + self.stoch_dim_total + self.context_dim
         coarse_in_dim = self.stoch_dim_total + self.context_dim
 
         self.with_proprio = with_proprio
         try:
-            current_embed_dim = crssm.cell.embed_dim
+            current_embed_dim = lstm.cell.embed_dim
         except MissingMandatoryValue:
             current_embed_dim = None
-        crssm.cell.embed_dim = self._infer_embed_dim(current_embed_dim, robot_dim)
-        self.crssm_core = hydra.utils.instantiate(crssm)
-        if not isinstance(self.crssm_core, ContextRSSMCore):
+        lstm.cell.embed_dim = self._infer_embed_dim(current_embed_dim, robot_dim)
+        self.lstm_core = hydra.utils.instantiate(lstm)
+        if not isinstance(self.lstm_core, ContextLSTMCore):
             raise TypeError(
-                "DreamerV2ContextRSSM expects crssm to instantiate ContextRSSMCore, "
-                f"got {type(self.crssm_core)}"
+                "DreamerV2LSTM expects lstm to instantiate ContextLSTMCore, "
+                f"got {type(self.lstm_core)}"
             )
 
         precise_cfg, coarse_cfg = self._prepare_decoder_cfgs(decoder, precise_in_dim, coarse_in_dim)
@@ -87,6 +88,7 @@ class DreamerV2ContextRSSM(WorldModel):
         self.context_kl_weight = getattr(loss, "context_kl_weight", 1.0)
         self.image_weight = loss.image_weight
         self.grad_clip = loss.grad_clip
+        # Note: gate-related losses will be zero since LSTM returns dummy gates
         self.gate_activity_weight = getattr(loss, "gate_activity_weight", 0.0)
         self.ctxt_sparsity_weight = getattr(loss, "ctxt_sparsity_weight", 0.0)
         self.task_weight = getattr(loss, "task_weight", 1.0)
@@ -170,16 +172,6 @@ class DreamerV2ContextRSSM(WorldModel):
         optimizer = Adam(self.parameters(), lr=3e-4)
         return {"optimizer": optimizer}
 
-    def on_fit_start(self):
-        """Setup wandb.watch for gradient and parameter tracking."""
-        if self.logger and hasattr(self.logger, 'experiment'):
-            logger_name = self.logger.__class__.__name__.lower()
-            if 'wandb' in logger_name:
-                # Watch model for gradients and parameters
-                # log_freq controls how often to log (None = log at each step when logging)
-                wandb.watch(self, log='all', log_freq=self.grad_log_interval, log_graph=False)
-                log_rank_0("Enabled wandb.watch for gradient and parameter tracking")
-
 
     def forward(
         self,
@@ -187,12 +179,12 @@ class DreamerV2ContextRSSM(WorldModel):
         s_obs: Tensor,
         act: Tensor,
         reset: Tensor,
-        in_state: Tensor,
+        in_state: Tuple[Tensor, Tensor, Tensor, Tensor],  # Now includes cell_state
         rgb_g: Tensor = None,
     ) -> Dict[str, Tensor]:
         embed = self._encode_observations(rgb_s, rgb_g, s_obs)
 
-        outputs, out_states = self.crssm_core.forward(embed, act, reset, in_state)
+        outputs, out_states = self.lstm_core.forward(embed, act, reset, in_state)
 
         precise_out = self.precise_decoder(outputs["features"])
         dcd_img_s, dcd_img_g, dcd_s_obs = self._unpack_precise_decoder(precise_out)
@@ -235,7 +227,7 @@ class DreamerV2ContextRSSM(WorldModel):
         return decoded, None
 
     def _infer_embed_dim(self, default_embed_dim: Optional[int], robot_dim: int) -> int:
-        """Derive the encoder output dimensionality expected by ContextRSSM."""
+        """Derive the encoder output dimensionality expected by ContextLSTM."""
         if hasattr(self.encoder, "cnn_out_dim"):
             img_dim = self.encoder.cnn_out_dim
         elif hasattr(self.encoder, "out_dim"):
@@ -244,7 +236,7 @@ class DreamerV2ContextRSSM(WorldModel):
             img_dim = self.encoder.cnn_depth * (2 ** (len(self.encoder.kernels) + 1))
         else:
             if default_embed_dim is None:
-                raise ValueError("Unable to infer encoder output dimension for ContextRSSM")
+                raise ValueError("Unable to infer encoder output dimension for ContextLSTM")
             img_dim = default_embed_dim
 
         embed_dim = img_dim
@@ -267,13 +259,13 @@ class DreamerV2ContextRSSM(WorldModel):
         return self.encoder(rgb_s, rgb_g)
 
     def on_train_epoch_start(self) -> None:
-        super(DreamerV2ContextRSSM, self).on_train_epoch_start()
-        self.in_state = self.crssm_core.init_state(self.train_batch_size)
+        super(DreamerV2LSTM, self).on_train_epoch_start()
+        self.in_state = self.lstm_core.init_state(self.train_batch_size)
         self.train_step_history = []
 
     def on_validation_epoch_start(self) -> None:
-        super(DreamerV2ContextRSSM, self).on_validation_epoch_start()
-        self.val_state = self.crssm_core.init_state(self.val_batch_size)
+        super(DreamerV2LSTM, self).on_validation_epoch_start()
+        self.val_state = self.lstm_core.init_state(self.val_batch_size)
         self.val_running_metrics: Dict[str, Tensor] = {}
         self.num_val_batches = 0
         self.val_gt_img_s: Optional[Tensor] = None
@@ -285,31 +277,14 @@ class DreamerV2ContextRSSM(WorldModel):
         # For tracking context changes
         self.context_change_images: List[Dict[str, Tensor]] = []
 
-    # def dream(
-    #     self,
-    #     act: Tensor,
-    #     in_state: Tuple[Tensor, Tensor, Tensor],
-    #     temperature: float = 1.0,
-    # ) -> Tuple[Tensor, Tensor, Tuple[Tensor, Tensor, Tensor]]:
-    #     with self.autocast:
-    #         precise_prior, ctxt_prior, next_state = self.crssm_core.imagine_step(
-    #             act, in_state, temperature=temperature
-    #         )
-    #     return precise_prior, ctxt_prior, next_state
-
-
-    
-
-    
-    
     def loss(self, batch: Dict[str, Tensor], outs: Dict[str, Tensor], context_task_loss = True) -> Dict[str, Tensor]:
         # Reconstruction losses split by camera and decoder head
         rgb_static = batch["rgb_obs"]["rgb_static"]
         precise_static = outs["dcd_img_s"]
         coarse_static = outs["coarse_rgb"]
 
-        loss_precise_static = 0.5 * torch.square(precise_static - rgb_static).sum(dim=[-1, -2, -3]) 
-        loss_coarse_static = 0.5 * torch.square(coarse_static - rgb_static).sum(dim=[-1, -2, -3]) 
+        loss_precise_static = 0.5 * torch.square(precise_static - rgb_static).sum(dim=[-1, -2, -3])
+        loss_coarse_static = 0.5 * torch.square(coarse_static - rgb_static).sum(dim=[-1, -2, -3])
 
         loss_precise_static_mean = loss_precise_static.mean()
         loss_coarse_static_mean = loss_coarse_static.mean()
@@ -318,8 +293,8 @@ class DreamerV2ContextRSSM(WorldModel):
         precise_gripper = outs["dcd_img_g"]
         coarse_gripper = outs["coarse_rgb_gripper"]
 
-        loss_precise_gripper = 0.5 * torch.square(precise_gripper - rgb_gripper).sum(dim=[-1, -2, -3]) 
-        loss_coarse_gripper = 0.5 * torch.square(coarse_gripper - rgb_gripper).sum(dim=[-1, -2, -3]) 
+        loss_precise_gripper = 0.5 * torch.square(precise_gripper - rgb_gripper).sum(dim=[-1, -2, -3])
+        loss_coarse_gripper = 0.5 * torch.square(coarse_gripper - rgb_gripper).sum(dim=[-1, -2, -3])
 
         loss_precise_gripper_mean = loss_precise_gripper.mean()
         loss_coarse_gripper_mean = loss_coarse_gripper.mean()
@@ -334,12 +309,12 @@ class DreamerV2ContextRSSM(WorldModel):
         precise_prior_logits = outs["precise_priors"]
         ctxt_prior_logits = outs["ctxt_priors"]
 
-        dpost = self.crssm_core.zdistr(post_logits)
-        dpost_detached = self.crssm_core.zdistr(post_logits.detach())
-        dprior_p = self.crssm_core.zdistr(precise_prior_logits)
-        dprior_p_detached = self.crssm_core.zdistr(precise_prior_logits.detach())
-        dprior_c = self.crssm_core.ctxt_zdistr(ctxt_prior_logits)
-        dprior_c_detached = self.crssm_core.ctxt_zdistr(ctxt_prior_logits.detach())
+        dpost = self.lstm_core.zdistr(post_logits)
+        dpost_detached = self.lstm_core.zdistr(post_logits.detach())
+        dprior_p = self.lstm_core.zdistr(precise_prior_logits)
+        dprior_p_detached = self.lstm_core.zdistr(precise_prior_logits.detach())
+        dprior_c = self.lstm_core.ctxt_zdistr(ctxt_prior_logits)
+        dprior_c_detached = self.lstm_core.ctxt_zdistr(ctxt_prior_logits.detach())
 
         loss_kl_c_1 = D.kl.kl_divergence(dpost_detached, dprior_c).mean()
         loss_kl_c_2 = D.kl.kl_divergence(dpost, dprior_c_detached).mean()
@@ -350,8 +325,7 @@ class DreamerV2ContextRSSM(WorldModel):
         loss_kl_c = (1 - self.kl_balance) * loss_kl_c_1 + self.kl_balance * loss_kl_c_2
         loss_kl_p = (1 - self.kl_balance) * loss_kl_p_1 + self.kl_balance * loss_kl_p_2
 
-        # Sparcity Loss
-
+        # Gate-related metrics (will be dummy values since LSTM doesn't have real gates)
         gates = outs["gates"]
         gate_activity = gates.mean()
         ctxt_sparsity = gate_activity
@@ -362,16 +336,6 @@ class DreamerV2ContextRSSM(WorldModel):
         latent_entropy_post = dpost.entropy().mean()
         latent_entropy_prior_p = dprior_p.entropy().mean()
         latent_entropy_prior_c = dprior_c.entropy().mean()
-
-
-        # posterior_probs = dpost.base_dist.probs
-        # prior_probs = dprior_p.base_dist.probs
-        # ctxt_probs = dprior_c.base_dist.probs
-
-        # latent_var_post = posterior_probs.var(dim=-1).mean()
-        # latent_var_prior = prior_probs.var(dim=-1).mean()
-        # latent_var_ctxt = ctxt_probs.var(dim=-1).mean()
-
 
         loss_gate_activity = self.gate_activity_weight * gate_activity
         loss_ctxt_sparsity = self.ctxt_sparsity_weight * ctxt_sparsity
@@ -421,9 +385,6 @@ class DreamerV2ContextRSSM(WorldModel):
             "latent_entropy_coarse_prior": latent_entropy_prior_c,
             "loss_task_prediction": loss_task_prediction,
             "task_accuracy": task_accuracy,
-            # "latent_var_post": latent_var_post,
-            # "latent_var_prior": latent_var_prior,
-            # "latent_var_ctxt": latent_var_ctxt,
         }
 
         # Optional context tracking metrics
@@ -547,18 +508,18 @@ class DreamerV2ContextRSSM(WorldModel):
         return losses["loss_total"]
 
     def on_train_epoch_end(self) -> None:
-        super(DreamerV2ContextRSSM, self).on_train_epoch_end()
+        super(DreamerV2LSTM, self).on_train_epoch_end()
         self._flush_train_metrics()
 
     def _ensure_state_batch_size(self, mode: str, batch_size: int) -> None:
         if mode == "train":
             state = getattr(self, "in_state", None)
             if state is None or state[0].shape[0] != batch_size:
-                self.in_state = self.crssm_core.init_state(batch_size)
+                self.in_state = self.lstm_core.init_state(batch_size)
         else:
             state = getattr(self, "val_state", None)
             if state is None or state[0].shape[0] != batch_size:
-                self.val_state = self.crssm_core.init_state(batch_size)
+                self.val_state = self.lstm_core.init_state(batch_size)
 
     def validation_step(self, batch: Dict[str, Tensor], batch_idx: int) -> Dict[str, Union[Tensor, Any]]:
         with self.autocast:
@@ -620,21 +581,6 @@ class DreamerV2ContextRSSM(WorldModel):
             key: val / float(self.num_val_batches) for key, val in self.val_running_metrics.items()
         }
         self.log_metrics(averaged_metrics, mode="val")
-
-        # Log summary statistics to wandb
-        if self.logger and hasattr(self.logger, 'experiment'):
-            logger_name = self.logger.__class__.__name__.lower()
-            if 'wandb' in logger_name:
-                # Log key metrics as wandb summary for easy comparison across runs
-                summary_metrics = {
-                    'val/best_loss_total': averaged_metrics.get('loss_total', 0.0).item(),
-                    'val/best_loss_reconstr': averaged_metrics.get('loss_reconstr', 0.0).item(),
-                    'val/best_loss_kl': averaged_metrics.get('loss_kl-p', 0.0).item() + averaged_metrics.get('loss_kl-c', 0.0).item(),
-                }
-                # Update wandb summary (persists across run)
-                for key, value in summary_metrics.items():
-                    if key not in wandb.run.summary or value < wandb.run.summary.get(key.replace('best_', ''), float('inf')):
-                        wandb.run.summary[key] = value
 
         self.log_images(
             mode="val",
@@ -709,8 +655,6 @@ class DreamerV2ContextRSSM(WorldModel):
             saved_images.append(("rgb_static_coarse", coarse_static))
 
         step = int(self.global_step)
-        # if mode == "train" and step % self.image_log_interval != 0:
-        #    return
 
         logger_name = self.logger.__class__.__name__.lower() if self.logger else ""
         images = []
@@ -987,19 +931,19 @@ class DreamerV2ContextRSSM(WorldModel):
             compute_grad_norm(self.encoder.parameters()), device=self.device
         )
 
-        # CRSSM core gradients
-        losses["grad-norm-crssm"] = torch.tensor(
-            compute_grad_norm(self.crssm_core.parameters()), device=self.device
+        # LSTM core gradients
+        losses["grad-norm-lstm"] = torch.tensor(
+            compute_grad_norm(self.lstm_core.parameters()), device=self.device
         )
 
-        # Break down CRSSM into sub-components
-        if hasattr(self.crssm_core, "cell"):
-            cell = self.crssm_core.cell
+        # Break down LSTM into sub-components
+        if hasattr(self.lstm_core, "cell"):
+            cell = self.lstm_core.cell
 
-            # Context RNN (GateL0RD) gradients - important for detecting context learning issues
-            if hasattr(cell, "context_rnn"):
-                losses["grad-norm-context_rnn"] = torch.tensor(
-                    compute_grad_norm(cell.context_rnn.parameters()), device=self.device
+            # Context LSTM gradients - important for detecting context learning issues
+            if hasattr(cell, "context_lstm"):
+                losses["grad-norm-context-lstm"] = torch.tensor(
+                    compute_grad_norm(cell.context_lstm.parameters()), device=self.device
                 )
 
             # GRU (precise dynamics) gradients
@@ -1022,7 +966,7 @@ class DreamerV2ContextRSSM(WorldModel):
             prior_params = []
             for attr in ["prior_mlp_h", "prior_mlp_c", "prior_norm", "prior_ensemble"]:
                 if hasattr(cell, attr):
-                    posterior_params.extend(getattr(cell, attr).parameters())
+                    prior_params.extend(getattr(cell, attr).parameters())
             if prior_params:
                 losses["grad-norm-prior"] = torch.tensor(
                     compute_grad_norm(prior_params), device=self.device
@@ -1034,21 +978,21 @@ class DreamerV2ContextRSSM(WorldModel):
                 if hasattr(cell, attr):
                     ctxt_params.extend(getattr(cell, attr).parameters())
             if ctxt_params:
-                losses["grad-norm-context_heads"] = torch.tensor(
+                losses["grad-norm-context-heads"] = torch.tensor(
                     compute_grad_norm(ctxt_params), device=self.device
                 )
 
         # Decoder gradients
-        losses["grad-norm-precise_decoder"] = torch.tensor(
+        losses["grad-norm-precise-decoder"] = torch.tensor(
             compute_grad_norm(self.precise_decoder.parameters()), device=self.device
         )
-        losses["grad-norm-coarse_decoder"] = torch.tensor(
+        losses["grad-norm-coarse-decoder"] = torch.tensor(
             compute_grad_norm(self.coarse_decoder.parameters()), device=self.device
         )
 
         # Task prediction head gradients (if using task supervision)
         if hasattr(self, "context_task_head"):
-            losses["grad-norm-task_head"] = torch.tensor(
+            losses["grad-norm-task-head"] = torch.tensor(
                 compute_grad_norm(self.context_task_head.parameters()), device=self.device
             )
 
@@ -1068,10 +1012,6 @@ class DreamerV2ContextRSSM(WorldModel):
         if not isinstance(grad_total_norm, torch.Tensor):
             grad_total_norm = torch.tensor(grad_total_norm, device=self.device)
         losses["grad-total-norm"] = grad_total_norm.detach()
-
-        # Log learning rate
-        if len(opt.param_groups) > 0:
-            losses["learning_rate"] = torch.tensor(opt.param_groups[0]['lr'], device=self.device)
 
         self.scaler.step(opt)
         self.scaler.update()

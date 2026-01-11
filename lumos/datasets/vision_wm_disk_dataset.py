@@ -57,9 +57,13 @@ class VisionWMDiskDataset(BaseWMDiskDataset):
                 if "npz" not in file_path.suffix:
                     continue
 
+                # Skip non-episode files
+                if "episode_" not in file_path.name:
+                    continue
+
                 key = self.extract_episode_number(file_path)
                 np_obj = load_npz(file_path)
-                data = {key: np.stack([np_obj[key]]) for key, _ in np_obj.items()}
+                data = {k: np_obj[k] for k in np_obj.keys()}
 
                 value = {
                     "rel_actions": np.squeeze(data["rel_actions"]),
@@ -67,6 +71,14 @@ class VisionWMDiskDataset(BaseWMDiskDataset):
                     "rgb_static": np.squeeze(data["rgb_static"]),
                     "rgb_gripper": np.squeeze(data["rgb_gripper"]),
                 }
+                # Add current_task_ids if available
+                # Don't squeeze it - keep the shape (1,) to maintain consistency
+                if "current_task_ids" in data:
+                    task_ids = data["current_task_ids"]
+                    # Remove only the first dimension added by stacking
+                    if task_ids.ndim > 1:
+                        task_ids = task_ids[0]
+                    value["current_task_ids"] = task_ids
                 self.preloaded_data[key] = value
 
             with open(str(cached_data_path), "wb") as f:

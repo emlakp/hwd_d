@@ -1,0 +1,10 @@
+# High-level action encoder/prior configuration
+_target_: lumos.utils.nn_utils.MLP
+_recursive_: false
+
+shape: [5]        # Number of high-level action classes
+layers: 3         # Number of hidden layers
+units: 200        # Units per hidden layer
+act: 'elu'        # Activation function
+norm: 'layer'     # Normalization type ('none', 'layer', 'batch')
+dist: 'onehot'    # Output distribution type

@@ -1,0 +1,5 @@
+defaults:
+  - cell: contextrssm_task_pred
+
+_target_: lumos.world_models.contextrssm.core.ContextRSSMCore
+_recursive_: false

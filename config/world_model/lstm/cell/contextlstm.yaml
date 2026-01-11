@@ -1,7 +1,7 @@
 defaults:
   - gru: default
 
-_target_: lumos.world_models.contextrssm.cell.ContextRSSMCell
+_target_: lumos.world_models.contextrssm.lstm_cell.ContextLSTMCell
 _recursive_: false
 
 embed_dim: ???

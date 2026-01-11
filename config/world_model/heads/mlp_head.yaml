@@ -1,0 +1,10 @@
+# Default MLP head configuration
+_target_: lumos.utils.nn_utils.MLP
+_recursive_: false
+
+shape: ???  # Must be specified (e.g., [5] for 5 classes, [7] for 7-dim action)
+layers: 3
+units: 200
+act: 'elu'
+norm: 'layer'
+dist: 'mse'  # Options: 'mse', 'normal', 'tanh_normal', 'trunc_normal', 'onehot', 'onehot_st', 'binary'

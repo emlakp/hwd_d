@@ -16,4 +16,4 @@ load_feats: false
 
 reset_prob: 0.01
 batch_size: 64
-seq_len: 10
+seq_len: 50

@@ -4,10 +4,9 @@ num_nodes: 1
 precision: 32
 max_epochs: 1000
 max_steps: -1
-log_every_n_steps: 1
-val_check_interval: 1.0
-deterministic: true
-check_val_every_n_epoch: 1
+log_every_n_steps: 50
+deterministic: false
 num_sanity_val_steps: 0
 overfit_batches: 1.0
 fast_dev_run: false
+limit_val_batches: 0  # Skip validation entirely

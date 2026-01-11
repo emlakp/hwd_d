@@ -123,11 +123,11 @@ def create_dataloader(cfg: DictConfig, train_tfms: Dict) -> Tuple[VisionWMDiskDa
     train_dir = PROJECT_ROOT / cfg.datamodule.root_data_dir / "training"
     dataset_cfg = cfg.datamodule.datasets.vision_dataset
 
-    # batch_size = cfg.datamodule.batch_size
-    batch_size = 32
+    batch_size = cfg.datamodule.batch_size
+    # batch_size = 64
     available = multiprocessing.cpu_count()
     OmegaConf.set_struct(dataset_cfg, False)
-    dataset_cfg.num_workers = min(max(1, available - 1), 8)
+    dataset_cfg.num_workers = max(1, available - 1)
     OmegaConf.set_struct(dataset_cfg, True)
 
     train_ds = VisionWMDiskDataset(
@@ -154,6 +154,7 @@ def create_dataloader(cfg: DictConfig, train_tfms: Dict) -> Tuple[VisionWMDiskDa
         shuffle=False,
         num_workers=dataset_cfg.num_workers,
         collate_fn=transpose_collate_wm,
+        persistent_workers=True if dataset_cfg.num_workers > 0 else False,
     )
 
     return train_ds, loader

@@ -1,0 +1,21 @@
+defaults:
+  - gru: task_pred
+
+_target_: lumos.world_models.contextrssm.cell.ContextRSSMCell
+_recursive_: false
+
+embed_dim: ???
+action_dim: ${datamodule.action_space}
+
+# Main RSSM dimensions
+deter_dim: 256
+stoch_dim: 32
+stoch_rank: 32
+hidden_dim: 256
+
+# Task prediction: Set context_dim=34 so the context vector represents 34 task logits
+# The context vector from GateL0RD will be used directly with F.cross_entropy(context, task_ids)
+context_dim: 34
+
+layer_norm: true
+ablate_context: false  # Set to true to disable context (ablation study)

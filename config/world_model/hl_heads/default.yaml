@@ -1,0 +1,44 @@
+# High-level CRSSM heads configuration
+# Each head is an MLP that predicts different outputs
+
+time:
+  _target_: lumos.utils.nn_utils.MLP
+  _recursive_: false
+  shape: [5]          # Time horizon bins
+  layers: 5           # Number of hidden layers
+  units: 1024         # Units per hidden layer
+  act: 'elu'
+  norm: 'layer'
+  dist: 'none'      # Categorical distribution over time bins
+
+action:
+  _target_: lumos.utils.nn_utils.MLP
+  _recursive_: false
+  shape: [5]          # Action dimension
+  layers: 3
+  units: 1024
+  act: 'elu'
+  norm: 'layer'
+  dist: 'onehot'      # Normal distribution for continuous actions
+
+reward:
+  _target_: lumos.utils.nn_utils.MLP
+  _recursive_: false
+  shape: [1]          # Scalar reward
+  layers: 3
+  units: 1024
+  act: 'elu'
+  norm: 'layer'
+  dist: 'normal'      # Normal distribution for reward prediction
+
+# Note: 'stoch' head will be set to hl_act_post in the code
+
+stoch:
+  _target_: lumos.utils.nn_utils.MLP
+  _recursive_: false
+  shape: [1024]          # Action dimension
+  layers: 3
+  units: 1024
+  act: 'elu'
+  norm: 'layer'
+  dist: 'normal'

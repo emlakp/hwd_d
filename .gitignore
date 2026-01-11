@@ -18,3 +18,49 @@ dataset/task_D_D/
 dataset/calvin/
 dataset/calvin_debug_dataset/
 dataset/*.zip
+
+# Analysis and plots
+*.png
+*.jpg
+*.jpeg
+*.pdf
+training_plots/
+loss_plots/
+
+# Reports
+*.txt
+
+# Wandb
+wandb/
+.wandb/
+
+# Hydra multirun
+multirun/
+.hydra/
+
+# Model weights
+*.pth
+*.pt
+
+# Jupyter notebooks
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.idea/
+.vscode/
+
+# Temporary and debug files
+tmp/
+temp/
+debug_*.py
+analyze_*.py
+plot_*.py
+profile_*.py
+diagnose_*.py
+visualize_*.py
+script_debug_*.py
+
+# OS
+.DS_Store
+Thumbs.db

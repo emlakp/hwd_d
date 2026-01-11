@@ -20,7 +20,7 @@ def load_pkl(filename: Path) -> Dict[str, np.ndarray]:
 
 
 def load_npz(filename: Path) -> Dict[str, np.ndarray]:
-    return np.load(filename.as_posix())
+    return np.load(filename.as_posix(), allow_pickle=True)
 
 
 class BaseWMDiskDataset(BaseDataset):
@@ -41,6 +41,7 @@ class BaseWMDiskDataset(BaseDataset):
         save_format: str = "npz",
         pretrain: bool = False,
         use_cached_data: bool = False,
+        skip_empty_task_ids: bool = False,
         **kwargs: Any,
     ):
         super().__init__(*args, **kwargs)
@@ -54,6 +55,7 @@ class BaseWMDiskDataset(BaseDataset):
         self.reset_prob = reset_prob
         self.pretrain = pretrain
         self.skip_frames = skip_frames
+        self.skip_empty_task_ids = skip_empty_task_ids
 
         self.episode_lookup, self.start_ids = self._build_file_indices(self.abs_datasets_dir)
 
@@ -107,6 +109,31 @@ class BaseWMDiskDataset(BaseDataset):
 
             episode["pre_robot_obs"] = np.roll(episode["robot_obs"], shift=1, axis=0)
             resets[0] = True
+
+            # Add current_task_ids if available in the episodes
+            try:
+                if "current_task_ids" in episodes[0]:
+                    # Normalize to shape (1,) by randomly picking one task if multiple exist
+                    # Maintain temporal consistency: frames with same task set pick same task
+                    task_set_to_choice = {}  # Maps tuple of task_ids -> chosen task_id
+
+                    normalized_task_ids = []
+                    for ep in episodes:
+                        task_ids = ep["current_task_ids"]
+                        if len(task_ids) > 1:
+                            # Use task set as key for consistent choice
+                            task_set = tuple(sorted(task_ids))
+                            if task_set not in task_set_to_choice:
+                                # First time seeing this task set, pick one randomly
+                                chosen_idx = np.random.randint(0, len(task_ids))
+                                task_set_to_choice[task_set] = task_ids[chosen_idx]
+                            chosen_task = task_set_to_choice[task_set]
+                            normalized_task_ids.append(np.array([chosen_task], dtype=task_ids.dtype))
+                        else:
+                            normalized_task_ids.append(task_ids)
+                    episode["current_task_ids"] = np.stack(normalized_task_ids)
+            except Exception:
+                pass  # If current_task_ids doesn't exist, skip it
         else:
             episodes = self.zip_sequence(start_idx - 1, end_idx)
 
@@ -116,6 +143,31 @@ class BaseWMDiskDataset(BaseDataset):
             episode["pre_actions"] = np.stack([ep["rel_actions"] for ep in episodes[:-1]])
 
             episode["pre_robot_obs"] = np.stack([ep["robot_obs"] for ep in episodes[:-1]])
+
+            # Add current_task_ids if available in the episodes
+            try:
+                if "current_task_ids" in episodes[0]:
+                    # Normalize to shape (1,) by randomly picking one task if multiple exist
+                    # Maintain temporal consistency: frames with same task set pick same task
+                    task_set_to_choice = {}  # Maps tuple of task_ids -> chosen task_id
+
+                    normalized_task_ids = []
+                    for ep in episodes[1:]:  # Skip first episode (it's the pre-frame)
+                        task_ids = ep["current_task_ids"]
+                        if len(task_ids) > 1:
+                            # Use task set as key for consistent choice
+                            task_set = tuple(sorted(task_ids))
+                            if task_set not in task_set_to_choice:
+                                # First time seeing this task set, pick one randomly
+                                chosen_idx = np.random.randint(0, len(task_ids))
+                                task_set_to_choice[task_set] = task_ids[chosen_idx]
+                            chosen_task = task_set_to_choice[task_set]
+                            normalized_task_ids.append(np.array([chosen_task], dtype=task_ids.dtype))
+                        else:
+                            normalized_task_ids.append(task_ids)
+                    episode["current_task_ids"] = np.stack(normalized_task_ids)
+            except Exception:
+                pass  # If current_task_ids doesn't exist, skip it
 
         # reset_indices = np.nonzero(resets.squeeze())[0]
         # for idx in reset_indices:
@@ -174,6 +226,9 @@ class BaseWMDiskDataset(BaseDataset):
                     "rgb_static": np.squeeze(data["rgb_static"]),
                     "rgb_gripper": np.squeeze(data["rgb_gripper"]),
                 }
+                # Add current_task_ids if available
+                if "current_task_ids" in data:
+                    value["current_task_ids"] = np.squeeze(data["current_task_ids"])
                 self.preloaded_data[key] = value
 
             with open(str(cached_data_path), "wb") as f:

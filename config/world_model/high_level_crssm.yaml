@@ -1,0 +1,17 @@
+# High-level CRSSM world model configuration
+defaults:
+  - hl_action_encoder: default
+  - hl_heads: default
+  - amp: default
+  - optimizer: adamw
+  - loss: contextrssm
+
+_target_: lumos.world_models.high_level_crssm.CRSSMHighLevel
+_recursive_: false
+
+name: high_level_crssm
+train_batch_size: 16
+val_batch_size: 16
+robot_dim: 15
+with_proprio: true
+use_gripper_camera: true
