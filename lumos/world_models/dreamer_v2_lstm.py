@@ -172,6 +172,14 @@ class DreamerV2LSTM(WorldModel):
         optimizer = Adam(self.parameters(), lr=3e-4)
         return {"optimizer": optimizer}
 
+    def on_fit_start(self):
+        """Setup wandb.watch for gradient and parameter tracking."""
+        if self.logger and hasattr(self.logger, 'experiment'):
+            logger_name = self.logger.__class__.__name__.lower()
+            if 'wandb' in logger_name:
+                # Watch model for gradients and parameters
+                wandb.watch(self, log='all', log_freq=self.grad_log_interval, log_graph=False)
+                log_rank_0("Enabled wandb.watch for gradient and parameter tracking")
 
     def forward(
         self,
@@ -349,11 +357,12 @@ class DreamerV2LSTM(WorldModel):
                 context_logits = self.context_task_head(outs["context"])
             flat_context_logits = context_logits.reshape(-1, context_logits.shape[-1])
             task_ids = batch["state_info"]["current_task_ids"].reshape(-1).long()
-            loss_task_prediction = F.cross_entropy(flat_context_logits, task_ids)
-            with torch.no_grad():
-                preds = flat_context_logits.argmax(dim=-1)
-                valid_mask = task_ids >= 0
-                if valid_mask.any():
+            # Only compute loss if there are valid task IDs (skip if all are -1)
+            valid_mask = task_ids >= 0
+            if valid_mask.any():
+                loss_task_prediction = F.cross_entropy(flat_context_logits, task_ids, ignore_index=-1)
+                with torch.no_grad():
+                    preds = flat_context_logits.argmax(dim=-1)
                     task_accuracy = (preds[valid_mask] == task_ids[valid_mask]).float().mean()
 
         loss = (

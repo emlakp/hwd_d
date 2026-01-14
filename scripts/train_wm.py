@@ -42,6 +42,10 @@ def train(cfg: DictConfig) -> None:
             from lumos.world_models.dreamer_v2_contextrssm import DreamerV2ContextRSSM
 
             model = DreamerV2ContextRSSM.load_from_checkpoint(chk.as_posix())
+        elif cfg.world_model.name == "dreamer_v2_lstm":
+            from lumos.world_models.dreamer_v2_lstm import DreamerV2LSTM
+
+            model = DreamerV2LSTM.load_from_checkpoint(chk.as_posix())
         else:
             raise NotImplementedError(f"Unknown model: {cfg.world_model.name}")
     else:

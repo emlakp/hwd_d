@@ -61,6 +61,8 @@ class ContextLSTMCell(nn.Module):
 
         # Context dynamics via simple LSTM
         self.context_lstm = nn.LSTMCell(self.hidden_dim, self.context_dim)
+        # Add LayerNorm to stabilize LSTM outputs
+        self.context_norm = self.norm(self.context_dim, eps=1e-3)
 
         # LSTM cell state (will be managed separately)
         self.init_cell_state = nn.Parameter(torch.zeros(self.context_dim))
@@ -177,6 +179,10 @@ class ContextLSTMCell(nn.Module):
 
         # Context dynamics using LSTM
         context, cell_state = self.context_lstm(za, (in_context, in_cell_state))
+        # Apply LayerNorm to LSTM output
+        context = self.context_norm(context)
+        # Clip cell state to prevent unbounded growth over long sequences
+        cell_state = torch.clamp(cell_state, min=-10, max=10)
 
         # Ablation: zero out context if ablate_context is True
         if self.ablate_context:
@@ -227,6 +233,8 @@ class ContextLSTMCell(nn.Module):
 
     def zdistr(self, pp: Tensor, temperature: float = 1.0) -> D.Distribution:
         logits = pp.reshape(pp.shape[:-1] + (self.stoch_dim, self.stoch_rank)) / temperature
+        # Clamp logits to prevent NaN/Inf during training
+        logits = torch.clamp(logits, min=-20, max=20)
         dist = D.OneHotCategoricalStraightThrough(logits=logits.float())
         dist = D.Independent(dist, 1)
         return dist

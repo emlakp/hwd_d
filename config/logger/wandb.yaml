@@ -2,9 +2,10 @@ _target_: pytorch_lightning.loggers.WandbLogger
 _recursive_: false
 save_dir: ${log_dir}/wandb
 save_code: true
-name: ???
+name: null  # Will be set by setup_logger
 group: null
 log_model: false
 project: ${script}
-entity: carrots
-id: ???
+entity: null  # Uses your default wandb entity
+id: null  # Will be set by setup_logger
+offline: false  # Ensure online syncing to wandb

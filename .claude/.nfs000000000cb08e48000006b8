@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/home/akopyane/rl/lumos/.venv/bin/python:*)",
+      "Bash(./script_debug_lstm.py)",
+      "Bash(tmux capture-pane:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

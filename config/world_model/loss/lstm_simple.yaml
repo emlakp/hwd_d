@@ -1,0 +1,22 @@
+kl_balance: 0.8
+kl_weight: 1.0
+context_kl_weight: 1.0
+image_weight: 1.0
+grad_clip: 100
+gate_activity_weight: 0.0
+ctxt_sparsity_weight: 0.0
+task_weight: 20.0  # Enable task prediction
+num_tasks: 34
+
+# Logging intervals
+image_log_interval: 1000
+grad_log_interval: 200
+metric_log_interval: null
+metric_flush_size: 500
+
+# Disable context tracking features to avoid potential issues
+track_context_changes: false
+track_context_variance: false
+track_context_update_freq: false
+log_context_heatmaps: false
+context_change_threshold: 0.1

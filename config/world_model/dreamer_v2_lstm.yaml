@@ -4,7 +4,7 @@ defaults:
   - lstm: contextlstm
   - amp: default
   - optimizer: adamw
-  - loss: contextrssm
+  - loss: lstm_simple
 
 _target_: lumos.world_models.dreamer_v2_lstm.DreamerV2LSTM
 _recursive_: false

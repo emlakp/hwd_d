@@ -4,13 +4,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+DATASETS_DIR = Path("/home/akopyane/Desktop/rl/new_data/training")
+
 import torch
 from lumos.datasets.vision_wm_disk_dataset import VisionWMDiskDataset
 from lumos.utils.nn_utils import transpose_collate_wm
 from torch.utils.data import DataLoader
 
+print(f"Loading dataset from {DATASETS_DIR}")
 dataset = VisionWMDiskDataset(
-    datasets_dir=Path("/home/akopyane/Desktop/rl/new_data/training"),
+    datasets_dir=DATASETS_DIR,
     obs_space={"rgb_obs": ["rgb_static", "rgb_gripper"], "state_obs": ["robot_obs"], "actions": ["rel_actions"]},
     proprio_state={"robot_obs": 15},
     key="lang",
