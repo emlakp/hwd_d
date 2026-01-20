@@ -64,3 +64,4 @@ script_debug_*.py
 # OS
 .DS_Store
 Thumbs.db
+.claude/.nfs000000000cb08e48000006b8

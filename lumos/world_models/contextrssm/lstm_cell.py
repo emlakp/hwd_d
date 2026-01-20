@@ -184,6 +184,12 @@ class ContextLSTMCell(nn.Module):
         # Clip cell state to prevent unbounded growth over long sequences
         cell_state = torch.clamp(cell_state, min=-10, max=10)
 
+        # Check for NaN and log
+        if torch.isnan(context).any():
+            print(f"NaN detected in context! in_context has NaN: {torch.isnan(in_context).any()}, za has NaN: {torch.isnan(za).any()}")
+        if torch.isnan(cell_state).any():
+            print(f"NaN detected in cell_state!")
+
         # Ablation: zero out context if ablate_context is True
         if self.ablate_context:
             context = torch.zeros_like(context)
@@ -191,6 +197,9 @@ class ContextLSTMCell(nn.Module):
         # Precise dynamics
         gru_input = torch.cat([za, context], dim=-1)
         h = self.gru(gru_input, in_h)
+
+        if torch.isnan(h).any():
+            print(f"NaN detected in GRU output h!")
 
         # Precise prior parameters
         prior_inp = self.prior_mlp_h(h) + self.prior_mlp_c(context)
@@ -208,6 +217,10 @@ class ContextLSTMCell(nn.Module):
         post_inp = self.post_norm(post_inp)
         post_inp = F.elu(post_inp)
         posterior_logits = self.post_mlp(post_inp)
+
+        if torch.isnan(posterior_logits).any():
+            print(f"NaN in posterior_logits! post_inp NaN: {torch.isnan(post_inp).any()}, h NaN: {torch.isnan(h).any()}, context NaN: {torch.isnan(context).any()}")
+            print(f"  embed NaN: {torch.isnan(embed).any() if embed is not None else 'N/A'}")
 
         posterior_dist = self.zdistr(posterior_logits, temperature)
         posterior_sample = posterior_dist.rsample().reshape(batch_size, -1)
@@ -233,7 +246,8 @@ class ContextLSTMCell(nn.Module):
 
     def zdistr(self, pp: Tensor, temperature: float = 1.0) -> D.Distribution:
         logits = pp.reshape(pp.shape[:-1] + (self.stoch_dim, self.stoch_rank)) / temperature
-        # Clamp logits to prevent NaN/Inf during training
+        # Replace NaN/Inf with zeros and clamp to prevent numerical issues
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=20.0, neginf=-20.0)
         logits = torch.clamp(logits, min=-20, max=20)
         dist = D.OneHotCategoricalStraightThrough(logits=logits.float())
         dist = D.Independent(dist, 1)

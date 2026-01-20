@@ -2,7 +2,7 @@ kl_balance: 0.8
 kl_weight: 1.0
 context_kl_weight: 1.0
 image_weight: 1.0
-grad_clip: 100
+grad_clip: 10  # Reduced from 100 to prevent gradient explosion
 gate_activity_weight: 0.0
 ctxt_sparsity_weight: 0.0
 task_weight: 20.0  # Enable task prediction

@@ -120,6 +120,8 @@ class BaseWMDiskDataset(BaseDataset):
                     normalized_task_ids = []
                     for ep in episodes:
                         task_ids = ep["current_task_ids"]
+                        # Handle scalar/0-dim arrays by converting to 1D
+                        task_ids = np.atleast_1d(task_ids)
                         if len(task_ids) > 1:
                             # Use task set as key for consistent choice
                             task_set = tuple(sorted(task_ids))
@@ -132,8 +134,8 @@ class BaseWMDiskDataset(BaseDataset):
                         else:
                             normalized_task_ids.append(task_ids)
                     episode["current_task_ids"] = np.stack(normalized_task_ids)
-            except Exception:
-                pass  # If current_task_ids doesn't exist, skip it
+            except Exception as e:
+                logger.warning(f"Failed to load current_task_ids: {e}")
         else:
             episodes = self.zip_sequence(start_idx - 1, end_idx)
 
@@ -154,6 +156,8 @@ class BaseWMDiskDataset(BaseDataset):
                     normalized_task_ids = []
                     for ep in episodes[1:]:  # Skip first episode (it's the pre-frame)
                         task_ids = ep["current_task_ids"]
+                        # Handle scalar/0-dim arrays by converting to 1D
+                        task_ids = np.atleast_1d(task_ids)
                         if len(task_ids) > 1:
                             # Use task set as key for consistent choice
                             task_set = tuple(sorted(task_ids))
@@ -166,8 +170,8 @@ class BaseWMDiskDataset(BaseDataset):
                         else:
                             normalized_task_ids.append(task_ids)
                     episode["current_task_ids"] = np.stack(normalized_task_ids)
-            except Exception:
-                pass  # If current_task_ids doesn't exist, skip it
+            except Exception as e:
+                logger.warning(f"Failed to load current_task_ids: {e}")
 
         # reset_indices = np.nonzero(resets.squeeze())[0]
         # for idx in reset_indices:
